@@ -1,4 +1,3 @@
-
 from flask import Flask, request, jsonify, send_file
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -7,8 +6,33 @@ import subprocess
 import json
 import math
 
+import os
+import hmac
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 80 * 1024 * 1024
+
+@app.before_request
+def check_api_key():
+    if request.path != "/edit":
+        return
+
+    expected = os.environ.get(
+        "VIDEO_EDITOR_API_KEY", ""
+    )
+    received = request.headers.get(
+        "X-Editor-Key", ""
+    )
+
+    if (
+        not expected
+        or not hmac.compare_digest(
+            received, expected
+        )
+    ):
+        return jsonify({
+            "error": "Unauthorized"
+        }), 401
 
 def run_ffmpeg(command):
     subprocess.run(
