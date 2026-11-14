@@ -14,7 +14,7 @@ app.config["MAX_CONTENT_LENGTH"] = 80 * 1024 * 1024
 
 @app.before_request
 def check_api_key():
-    if request.path != "/edit":
+    if request.path not in ("/edit", "/extract-frames"):
         return
 
     expected = os.environ.get(
