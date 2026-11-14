@@ -8,7 +8,7 @@ import math
 
 import os
 import hmac
-
+import base64
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 80 * 1024 * 1024
 
@@ -170,6 +170,116 @@ def edit_video():
             subprocess.TimeoutExpired):
         return jsonify({
             "error": "FFmpeg 影片處理失敗"
+        }), 500
+
+@app.post("/extract-frames")
+def extract_frames():
+    video = request.files.get("video")
+    timestamps_text = request.form.get("timestamps")
+
+    if not video or not timestamps_text:
+        return jsonify({
+            "error": "需要 video 和 timestamps"
+        }), 400
+
+    try:
+        timestamps = json.loads(timestamps_text)
+
+        if (
+            not isinstance(timestamps, list)
+            or not 1 <= len(timestamps) <= 6
+            or any(
+                type(t) not in (int, float)
+                or not math.isfinite(t)
+                or t < 0
+                for t in timestamps
+            )
+        ):
+            return jsonify({
+                "error": "timestamps 必須是 1 至 6 個非負秒數"
+            }), 400
+
+        with TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            source = folder / "source.mp4"
+            video.save(source)
+
+            probe = subprocess.run(
+                [
+                    "ffprobe", "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(source)
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30
+            )
+
+            duration = float(probe.stdout.strip())
+
+            if (
+                not math.isfinite(duration)
+                or duration <= 0
+                or any(t >= duration for t in timestamps)
+            ):
+                return jsonify({
+                    "error": "抽幀時間超出影片長度"
+                }), 400
+
+            frames = []
+
+            for i, timestamp in enumerate(timestamps):
+                output = folder / f"frame_{i:03d}.jpg"
+
+                run_ffmpeg([
+                    "ffmpeg", "-y",
+                    "-ss", str(timestamp),
+                    "-i", str(source),
+                    "-frames:v", "1",
+                    "-vf",
+                    "scale=640:-2",
+                    "-q:v", "4",
+                    str(output)
+                ])
+
+                raw = output.read_bytes()
+
+                if not raw.startswith(b"\xff\xd8"):
+                    raise ValueError("抽幀結果不是 JPEG")
+
+                encoded = base64.b64encode(
+                    raw
+                ).decode("ascii")
+
+                frames.append({
+                    "timestamp_sec": timestamp,
+                    "mimeType": "image/jpeg",
+                    "imageDataUrl":
+                        "data:image/jpeg;base64,"
+                        + encoded
+                })
+
+            return jsonify({
+                "duration_sec": duration,
+                "frame_count": len(frames),
+                "frames": frames
+            })
+
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return jsonify({
+            "error": "影片或時間碼資料無效"
+        }), 400
+
+    except (
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        OSError
+    ):
+        return jsonify({
+            "error": "FFmpeg 抽幀失敗"
         }), 500
 
 if __name__ == "__main__":
