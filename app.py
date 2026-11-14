@@ -108,19 +108,30 @@ def edit_video():
                 name = f"clip_{i:03d}.mp4"
                 target = folder / name
 
+               
                 run_ffmpeg([
-                    "ffmpeg", "-y",
-                    "-i", str(source),
-                    "-ss", str(start),
-                    "-t", str(end - start),
-                    "-map", "0:v:0", "-an",
-                    "-vf", "fps=30,scale=1280:-2,setsar=1",
-                    "-c:v", "libx264",
-                    "-preset", "veryfast",
-                    "-crf", "23",
-                    "-pix_fmt", "yuv420p",
-                    str(target)
-                ])
+                "ffmpeg", "-y",
+                "-i", str(source),
+                "-ss", str(start),
+                "-t", str(end - start),
+
+                # 保留影片，以及存在時的原始音軌
+                "-map", "0:v:0",
+                "-map", "0:a:0?",
+
+                # 高畫質輸出，保留原始解析度及幀率
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "18",
+                "-pix_fmt", "yuv420p",
+
+    # 保留音訊並轉成 MP4 相容的 AAC
+                "-c:a", "aac",
+                "-b:a", "192k",
+
+                str(target)
+            ])
+
 
                 names.append(name)
 
