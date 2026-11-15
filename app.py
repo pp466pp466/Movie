@@ -31,6 +31,7 @@ def check_api_key():
         "/tts",
         "/audio-info",
         "/mix-narration",
+        "/burn-subtitles",
     ):
         return
 
@@ -893,6 +894,104 @@ def mix_narration():
     except (subprocess.CalledProcessError, OSError, ValueError, json.JSONDecodeError):
         app.logger.exception("Narration mix failed")
         return jsonify({"error": "音訊混音失敗，請檢查 Render Logs"}), 500
+
+
+
+# ==========================================
+# 將 SRT 繁體中文字幕燒錄到已混音的 MP4
+# POST /burn-subtitles
+# multipart: video (MP4), srt (UTF-8 SRT 文字)
+# ==========================================
+
+@app.post("/burn-subtitles")
+def burn_subtitles():
+    video = request.files.get("video")
+    subtitle_text = request.form.get("srt", "")
+
+    if not video:
+        return jsonify({"error": "需要上傳 video (MP4)"}), 400
+
+    if not isinstance(subtitle_text, str) or not subtitle_text.strip():
+        return jsonify({"error": "需要提供 srt 字幕內容"}), 400
+
+    if len(subtitle_text) > 30000:
+        return jsonify({"error": "SRT 文字超過 30000 字元"}), 400
+
+    if "-->" not in subtitle_text:
+        return jsonify({"error": "無效的 SRT：找不到時間碼"}), 400
+
+    try:
+        with TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            source_video = folder / "input.mp4"
+            subtitle_file = folder / "captions.srt"
+            output = folder / "video_with_subtitles.mp4"
+
+            video.save(source_video)
+            subtitle_file.write_text(
+                subtitle_text.lstrip("\ufeff"),
+                encoding="utf-8",
+            )
+
+            # 用 libass 燒錄字幕；需要 FFmpeg 支援 subtitles 濾鏡。
+            # Render 上如果缺少繁體中文字型，可能會顯示方框，
+            # 此時需在 Render 另外安裝 CJK 字型。
+            style = (
+                "FontName=Noto Sans CJK TC,"
+                "FontSize=24,"
+                "PrimaryColour=&H00FFFFFF,"
+                "OutlineColour=&H00000000,"
+                "BorderStyle=1,"
+                "Outline=2,"
+                "Shadow=1,"
+                "Alignment=2,"
+                "MarginV=30"
+            )
+            subtitle_filter = (
+                f"subtitles={subtitle_file}:force_style='{style}'"
+            )
+
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-nostdin", "-hide_banner",
+                    "-loglevel", "error", "-y",
+                    "-i", str(source_video),
+                    "-vf", subtitle_filter,
+                    "-map", "0:v:0",
+                    "-map", "0:a?",
+                    "-c:v", "libx264",
+                    "-preset", "veryfast",
+                    "-crf", "22",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "copy",
+                    "-movflags", "+faststart",
+                    str(output),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+
+            if not output.exists() or output.stat().st_size <= 1024:
+                raise ValueError("輸出檔案過小")
+
+            return send_file(
+                BytesIO(output.read_bytes()),
+                mimetype="video/mp4",
+                as_attachment=True,
+                download_name="video_with_subtitles.mp4",
+            )
+
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "FFmpeg 字幕燒錄逾時"}), 504
+
+    except (subprocess.CalledProcessError, OSError, ValueError):
+        app.logger.exception("Subtitle burn failed")
+        return jsonify({
+            "error": "字幕燒錄失敗，請檢查 Render Logs 與中文字型"
+        }), 500
 
 
 # ==========================================
