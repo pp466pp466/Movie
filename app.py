@@ -1,107 +1,96 @@
-            ):
-                return jsonify({
-                    "error": "影片長度無效"
-                }), 400
+from flask import Flask, request, jsonify, send_file
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from io import BytesIO
+import subprocess
+import json
+import math
+import os
+import hmac
+import base64
 
-            # 使用 FFmpeg select + showinfo
-            # 找出畫面明顯變化的時間點
-            scene_filter = (
-                "scale=320:-2,"
-                f"select='gt(scene,{threshold})',"
-                "showinfo"
-            )
 
-            result = subprocess.run(
-                [
-                    "ffmpeg",
-                    "-nostdin",
-                    "-hide_banner",
-                    "-loglevel", "info",
-                    "-i", str(source),
-                    "-vf", scene_filter,
-                    "-an",
-                    "-f", "null",
-                    "-"
-                ],
-                capture_output=True,
-                text=True,
-                timeout=180,
-                check=True
-            )
+app = Flask(__name__)
 
-            # showinfo 會輸出 pts_time
-            matches = re.findall(
-                r"pts_time:\s*([0-9]+(?:\.[0-9]+)?)",
-                result.stderr
-            )
+# 最大上傳檔案大小：80 MB
+app.config["MAX_CONTENT_LENGTH"] = 80 * 1024 * 1024
 
-            # 依時間排序並去除重複
-            boundaries = [0.0]
 
-            for value in matches:
-                timestamp = float(value)
+# ==========================================
+# API Key 驗證
+# ==========================================
 
-                if (
-                    0 < timestamp < duration
-                    and timestamp > boundaries[-1] + 0.001
-                ):
-                    boundaries.append(
-                        round(timestamp, 3)
-                    )
+@app.before_request
+def check_api_key():
 
-            boundaries.append(
-                round(duration, 3)
-            )
+    # 只保護影片剪輯與抽幀 API
+    if request.path not in (
+        "/edit",
+        "/extract-frames",
+        "/detect-scenes",
+    ):
+        return
 
-            # 轉換成連續場景區間
-            scenes = []
+    expected = os.environ.get(
+        "VIDEO_EDITOR_API_KEY", ""
+    )
 
-            for i in range(len(boundaries) - 1):
+    received = request.headers.get(
+        "X-Editor-Key", ""
+    )
 
-                start = boundaries[i]
-                end = boundaries[i + 1]
-
-                scenes.append({
-                    "scene_index": i,
-                    "start_sec": start,
-                    "end_sec": end,
-                    "duration_sec": round(
-                        end - start, 3
-                    )
-                })
-
-            return jsonify({
-                "status": "success",
-                "duration_sec": duration,
-                "threshold": threshold,
-                "scene_count": len(scenes),
-                "scene_boundaries": boundaries,
-                "scenes": scenes
-            })
-
-    except subprocess.TimeoutExpired:
-        return jsonify({
-            "error": "場景偵測逾時"
-        }), 504
-
-    except (
-        subprocess.CalledProcessError,
-        OSError,
-        ValueError
+    if (
+        not expected
+        or not hmac.compare_digest(
+            received, expected
+        )
     ):
         return jsonify({
-            "error": "FFmpeg 場景偵測失敗"
-        }), 500
+            "error": "Unauthorized"
+        }), 401
+
 
 # ==========================================
-# Flask 本機啟動
-# Render 正式環境由 Gunicorn 啟動
+# FFmpeg 共用執行函式
 # ==========================================
 
-if __name__ == "__main__":
-
-    app.run(
-        host="127.0.0.1",
-        port=5000,
-        debug=False
+def run_ffmpeg(command):
+    subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=180
     )
+
+
+# ==========================================
+# 健康檢查 API
+# ==========================================
+
+@app.get("/health")
+def health():
+
+    return jsonify({
+        "status": "ok",
+        "service": "video-editor"
+    })
+
+
+# ==========================================
+# 既有影片剪輯 API
+# 保留原本成功的剪輯邏輯
+# ==========================================
+
+@app.post("/edit")
+def edit_video():
+
+    video = request.files.get("video")
+    plan_text = request.form.get("edit_plan")
+
+    if not video or not plan_text:
+        return jsonify({
+            "error": "需要 video 和 edit_plan"
+        }), 400
+
+    try:
