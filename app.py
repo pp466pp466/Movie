@@ -64,7 +64,8 @@ def run_ffmpeg(command):
         check=True,
         capture_output=True,
         text=True,
-        timeout=180
+        timeout=600,
+        check=True
     )
 
 
