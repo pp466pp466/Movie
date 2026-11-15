@@ -517,6 +517,7 @@ def extract_frames():
 # POST /detect-scenes
 # ==========================================
 
+
 @app.post("/detect-scenes")
 def detect_scenes():
 
@@ -556,7 +557,7 @@ def detect_scenes():
 
             video.save(source)
 
-            # 取得影片長度
+            # 取得原始影片長度
             probe = subprocess.run(
                 [
                     "ffprobe",
@@ -585,8 +586,7 @@ def detect_scenes():
                     "error": "影片長度無效"
                 }), 400
 
-            # 使用 FFmpeg select + showinfo
-            # 找出畫面明顯變化的時間點
+            # FFmpeg 場景變化偵測
             scene_filter = (
                 "scale=320:-2,"
                 f"select='gt(scene,{threshold})',"
@@ -607,11 +607,11 @@ def detect_scenes():
                 ],
                 capture_output=True,
                 text=True,
-                timeout=180,
+                timeout=600,
                 check=True
             )
 
-            # showinfo 會輸出 pts_time
+            # 從 FFmpeg 記錄擷取場景時間碼
             matches = re.findall(
                 r"pts_time:\s*([0-9]+(?:\.[0-9]+)?)",
                 result.stderr
@@ -635,7 +635,7 @@ def detect_scenes():
                 round(duration, 3)
             )
 
-            # 轉換成連續場景區間
+            # 建立各場景的起訖時間
             scenes = []
 
             for i in range(len(boundaries) - 1):
