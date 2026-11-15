@@ -28,6 +28,7 @@ def check_api_key():
         "/edit",
         "/extract-frames",
         "/detect-scenes",
+        "/tts",
     ):
         return
 
@@ -668,6 +669,66 @@ def detect_scenes():
         return jsonify({
             "error": "FFmpeg 場景偵測失敗"
         }), 500
+
+# ==========================================
+# 中文旁白轉 MP3 API
+# POST /tts  (JSON body)
+# 這是增量功能，不影響既有 FFmpeg 三個 API。
+# ==========================================
+
+@app.post("/tts")
+def generate_tts():
+    import re
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "請使用 JSON 傳入 text"}), 400
+
+    speech_text = payload.get("text")
+    if not isinstance(speech_text, str) or not speech_text.strip():
+        return jsonify({"error": "text 必須為非空字串"}), 400
+
+    speech_text = speech_text.strip()
+    if len(speech_text) > 1000:
+        return jsonify({"error": "測試階段 text 最多 1000 字"}), 400
+
+    voice = payload.get("voice", "zh-TW-YunJheNeural")
+    if voice not in ("zh-TW-YunJheNeural", "zh-TW-HsiaoChenNeural"):
+        return jsonify({"error": "目前僅支援兩種台灣中文語音"}), 400
+
+    rate = payload.get("rate", "+0%")
+    if not isinstance(rate, str) or not re.fullmatch(r"[+-]\d{1,2}%", rate):
+        return jsonify({"error": "rate 格式應為 +0%、+10%、-10% 等"}), 400
+    if int(rate[:-1]) < -50 or int(rate[:-1]) > 50:
+        return jsonify({"error": "rate 必須介於 -50% 和 +50%"}), 400
+
+    try:
+        # 在函式內匯入，避免缺少 TTS 套件時連 /health 都無法啟動。
+        import edge_tts
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "narration.mp3"
+            speaker = edge_tts.Communicate(
+                speech_text,
+                voice=voice,
+                rate=rate,
+            )
+            speaker.save_sync(str(target))
+
+            audio_bytes = target.read_bytes()
+            if len(audio_bytes) < 1024:
+                raise ValueError("語音檔過小，可能合成失敗")
+
+            return send_file(
+                BytesIO(audio_bytes),
+                mimetype="audio/mpeg",
+                as_attachment=True,
+                download_name="narration.mp3",
+            )
+    except Exception:
+        app.logger.exception("TTS generation failed")
+        return jsonify({"error": "TTS 服務暫時無法產生音訊"}), 502
+
 
 # ==========================================
 # Flask 本機啟動
