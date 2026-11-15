@@ -29,6 +29,8 @@ def check_api_key():
         "/extract-frames",
         "/detect-scenes",
         "/tts",
+        "/audio-info",
+        "/mix-narration",
     ):
         return
 
@@ -728,6 +730,169 @@ def generate_tts():
     except Exception:
         app.logger.exception("TTS generation failed")
         return jsonify({"error": "TTS 服務暫時無法產生音訊"}), 502
+
+
+# ==========================================
+# MP3 音訊長度資訊
+# POST /audio-info (multipart: audio)
+# ==========================================
+
+def probe_media_info(media_path):
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration:stream=codec_type",
+            "-of", "json", str(media_path)
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    details = json.loads(result.stdout)
+    duration = float(details.get("format", {}).get("duration", 0))
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("無法取得媒體長度")
+
+    streams = details.get("streams", [])
+    return {
+        "duration_sec": round(duration, 3),
+        "has_audio": any(x.get("codec_type") == "audio" for x in streams),
+        "has_video": any(x.get("codec_type") == "video" for x in streams),
+    }
+
+
+@app.post("/audio-info")
+def audio_info():
+    audio = request.files.get("audio")
+    if not audio:
+        return jsonify({"error": "請上傳 audio (MP3)"}), 400
+
+    try:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "narration.mp3"
+            audio.save(path)
+            info = probe_media_info(path)
+            if not info["has_audio"]:
+                return jsonify({"error": "上傳檔案沒有音訊軌"}), 400
+            return jsonify({
+                "status": "success",
+                "audio_duration_sec": info["duration_sec"],
+                "size_bytes": path.stat().st_size,
+            })
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "音訊檢查逾時"}), 504
+    except (subprocess.CalledProcessError, OSError, ValueError, json.JSONDecodeError):
+        app.logger.exception("Audio probe failed")
+        return jsonify({"error": "無法讀取音訊資訊"}), 400
+
+
+# ==========================================
+# 原始剪輯影片 + 旁白 MP3 混音
+# POST /mix-narration (multipart: video, audio)
+# video: 已完成剪輯的 MP4
+# audio: TTS 旁白 MP3
+# ==========================================
+
+@app.post("/mix-narration")
+def mix_narration():
+    video = request.files.get("video")
+    audio = request.files.get("audio")
+    if not video or not audio:
+        return jsonify({"error": "需要 video (MP4) 和 audio (MP3)"}), 400
+
+    try:
+        original_volume = float(request.form.get("original_volume", "0.25"))
+        narration_volume = float(request.form.get("narration_volume", "1.0"))
+    except (ValueError, TypeError):
+        return jsonify({"error": "音量必須為數字"}), 400
+
+    if (
+        not math.isfinite(original_volume)
+        or not math.isfinite(narration_volume)
+        or not 0 <= original_volume <= 1
+        or not 0 <= narration_volume <= 1.5
+    ):
+        return jsonify({"error": "original_volume 需介於 0～1，narration_volume 需介於 0～1.5"}), 400
+
+    try:
+        with TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            source_video = folder / "input.mp4"
+            source_audio = folder / "narration.mp3"
+            output = folder / "video_with_narration.mp4"
+            video.save(source_video)
+            audio.save(source_audio)
+
+            vinfo = probe_media_info(source_video)
+            ainfo = probe_media_info(source_audio)
+            if not vinfo["has_video"]:
+                return jsonify({"error": "video 不包含影片軌"}), 400
+            if not ainfo["has_audio"]:
+                return jsonify({"error": "audio 不包含音訊軌"}), 400
+
+            video_duration = vinfo["duration_sec"]
+            audio_duration = ainfo["duration_sec"]
+
+            # 不要默默截斷旁白。時間超出時先回報時長及建議語速。
+            if audio_duration > video_duration + 0.1:
+                speedup_pct = math.ceil(
+                    ((audio_duration + 0.35) / video_duration - 1) * 100
+                )
+                return jsonify({
+                    "error": "旁白比影片長，尚未混音；請提高 TTS rate 或縮短旁白",
+                    "video_duration_sec": video_duration,
+                    "audio_duration_sec": audio_duration,
+                    "suggested_tts_rate": "+{}%".format(min(50, max(0, speedup_pct))),
+                    "note": "建議語速為粗略估算；重新產生 MP3 後仍須檢查秒數",
+                }), 422
+
+            video_end = "{:.3f}".format(video_duration)
+            if vinfo["has_audio"]:
+                graph = (
+                    "[0:a:0]volume={:.3f},apad,atrim=duration={},asetpts=PTS-STARTPTS[bg];"
+                    "[1:a:0]volume={:.3f},apad,atrim=duration={},asetpts=PTS-STARTPTS[voice];"
+                    "[bg][voice]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[a]"
+                ).format(
+                    original_volume, video_end,
+                    narration_volume, video_end,
+                )
+            else:
+                graph = (
+                    "[1:a:0]volume={:.3f},apad,atrim=duration={},asetpts=PTS-STARTPTS[a]"
+                ).format(narration_volume, video_end)
+
+            subprocess.run(
+                [
+                    "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(source_video), "-i", str(source_audio),
+                    "-filter_complex", graph,
+                    "-map", "0:v:0", "-map", "[a]",
+                    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                    "-t", video_end, "-movflags", "+faststart",
+                    str(output),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+
+            if not output.exists() or output.stat().st_size <= 1024:
+                raise ValueError("輸出影片檔案過小")
+
+            return send_file(
+                BytesIO(output.read_bytes()),
+                mimetype="video/mp4",
+                as_attachment=True,
+                download_name="video_with_narration.mp4",
+            )
+
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "FFmpeg 混音逾時"}), 504
+    except (subprocess.CalledProcessError, OSError, ValueError, json.JSONDecodeError):
+        app.logger.exception("Narration mix failed")
+        return jsonify({"error": "音訊混音失敗，請檢查 Render Logs"}), 500
 
 
 # ==========================================
