@@ -58,15 +58,16 @@ def check_api_key():
 # FFmpeg 共用執行函式
 # ==========================================
 
+
 def run_ffmpeg(command):
     subprocess.run(
         command,
         check=True,
         capture_output=True,
         text=True,
-        timeout=600,
-        check=True
+        timeout=600
     )
+
 
 
 # ==========================================
