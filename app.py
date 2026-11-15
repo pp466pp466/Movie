@@ -25,8 +25,12 @@ app.config["MAX_CONTENT_LENGTH"] = 80 * 1024 * 1024
 def check_api_key():
 
     # 只保護影片剪輯與抽幀 API
-    if request.path not in ("/edit", "/extract-frames"):
-        return
+    if request.path not in (
+    "/edit",
+    "/extract-frames",
+    "/detect-scenes"
+):
+    return
 
     expected = os.environ.get(
         "VIDEO_EDITOR_API_KEY", ""
