@@ -508,6 +508,169 @@ def extract_frames():
 
 
 # ==========================================
+# FFmpeg 自動場景切換偵測 API
+# POST /detect-scenes
+# ==========================================
+
+@app.post("/detect-scenes")
+def detect_scenes():
+
+    import re
+
+    video = request.files.get("video")
+
+    if not video:
+        return jsonify({
+            "error": "需要上傳 video"
+        }), 400
+
+    # 場景變化偵測門檻
+    # 越低越敏感，可能偵測到更多切換
+    try:
+        threshold = float(
+            request.form.get("threshold", "0.35")
+        )
+    except (TypeError, ValueError):
+        return jsonify({
+            "error": "threshold 必須是數字"
+        }), 400
+
+    if (
+        not math.isfinite(threshold)
+        or not 0.1 <= threshold <= 0.8
+    ):
+        return jsonify({
+            "error": "threshold 必須介於 0.1 至 0.8"
+        }), 400
+
+    try:
+        with TemporaryDirectory() as tmp:
+
+            folder = Path(tmp)
+            source = folder / "source.mp4"
+
+            video.save(source)
+
+            # 取得影片長度
+            probe = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v", "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(source)
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30
+            )
+
+            duration = float(
+                probe.stdout.strip()
+            )
+
+            if (
+                not math.isfinite(duration)
+                or duration <= 0
+            ):
+                return jsonify({
+                    "error": "影片長度無效"
+                }), 400
+
+            # 使用 FFmpeg select + showinfo
+            # 找出畫面明顯變化的時間點
+            scene_filter = (
+                "scale=320:-2,"
+                f"select='gt(scene,{threshold})',"
+                "showinfo"
+            )
+
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-nostdin",
+                    "-hide_banner",
+                    "-loglevel", "info",
+                    "-i", str(source),
+                    "-vf", scene_filter,
+                    "-an",
+                    "-f", "null",
+                    "-"
+                ],
+                capture_output=True,
+                text=True,
+                timeout=180,
+                check=True
+            )
+
+            # showinfo 會輸出 pts_time
+            matches = re.findall(
+                r"pts_time:\s*([0-9]+(?:\.[0-9]+)?)",
+                result.stderr
+            )
+
+            # 依時間排序並去除重複
+            boundaries = [0.0]
+
+            for value in matches:
+                timestamp = float(value)
+
+                if (
+                    0 < timestamp < duration
+                    and timestamp > boundaries[-1] + 0.001
+                ):
+                    boundaries.append(
+                        round(timestamp, 3)
+                    )
+
+            boundaries.append(
+                round(duration, 3)
+            )
+
+            # 轉換成連續場景區間
+            scenes = []
+
+            for i in range(len(boundaries) - 1):
+
+                start = boundaries[i]
+                end = boundaries[i + 1]
+
+                scenes.append({
+                    "scene_index": i,
+                    "start_sec": start,
+                    "end_sec": end,
+                    "duration_sec": round(
+                        end - start, 3
+                    )
+                })
+
+            return jsonify({
+                "status": "success",
+                "duration_sec": duration,
+                "threshold": threshold,
+                "scene_count": len(scenes),
+                "scene_boundaries": boundaries,
+                "scenes": scenes
+            })
+
+    except subprocess.TimeoutExpired:
+        return jsonify({
+            "error": "場景偵測逾時"
+        }), 504
+
+    except (
+        subprocess.CalledProcessError,
+        OSError,
+        ValueError
+    ):
+        return jsonify({
+            "error": "FFmpeg 場景偵測失敗"
+        }), 500
+
+# ==========================================
 # Flask 本機啟動
 # Render 正式環境由 Gunicorn 啟動
 # ==========================================
