@@ -169,8 +169,8 @@ def edit_video():
 
                 run_ffmpeg([
                     "ffmpeg", "-y",
-                    "-i", str(source),
                     "-ss", str(start),
+                    "-i", str(source),
                     "-t", str(end - start),
 
                     # 保留原始畫面及存在時的音軌
