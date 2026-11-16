@@ -711,26 +711,46 @@ def generate_tts():
     try:
         # 在函式內匯入，避免缺少 TTS 套件時連 /health 都無法啟動。
         import edge_tts
+        from edge_tts.exceptions import NoAudioReceived
+        import time
 
         with TemporaryDirectory() as tmp:
             target = Path(tmp) / "narration.mp3"
-            speaker = edge_tts.Communicate(
-                speech_text,
-                voice=voice,
-                rate=rate,
-            )
-            speaker.save_sync(str(target))
+            retry_delays = (2, 5)
 
-            audio_bytes = target.read_bytes()
-            if len(audio_bytes) < 1024:
-                raise ValueError("語音檔過小，可能合成失敗")
+            for attempt in range(3):
+                try:
+                    # 每次都建立新連線，並避免使用上一次失敗的殘留檔案。
+                    target.unlink(missing_ok=True)
+                    speaker = edge_tts.Communicate(
+                        speech_text,
+                        voice=voice,
+                        rate=rate,
+                    )
+                    speaker.save_sync(str(target))
 
-            return send_file(
-                BytesIO(audio_bytes),
-                mimetype="audio/mpeg",
-                as_attachment=True,
-                download_name="narration.mp3",
-            )
+                    audio_bytes = target.read_bytes()
+                    if len(audio_bytes) < 1024:
+                        raise ValueError("語音檔過小，可能合成失敗")
+
+                    return send_file(
+                        BytesIO(audio_bytes),
+                        mimetype="audio/mpeg",
+                        as_attachment=True,
+                        download_name="narration.mp3",
+                    )
+                except NoAudioReceived:
+                    if attempt == 2:
+                        # 讓外層保留完整 traceback，方便查看 Render Logs。
+                        raise
+                    delay = retry_delays[attempt]
+                    app.logger.warning(
+                        "TTS NoAudioReceived (attempt %d/3); retry in %ds",
+                        attempt + 1,
+                        delay,
+                    )
+                    time.sleep(delay)
+
     except Exception:
         app.logger.exception("TTS generation failed")
         return jsonify({"error": "TTS 服務暫時無法產生音訊"}), 502
