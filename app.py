@@ -30,6 +30,7 @@ def check_api_key():
         "/detect-scenes",
         "/tts",
         "/audio-info",
+        "/concat-audio",
         "/mix-narration",
         "/burn-subtitles",
     ):
@@ -168,8 +169,8 @@ def edit_video():
 
                 run_ffmpeg([
                     "ffmpeg", "-y",
-                    "-i", str(source),
                     "-ss", str(start),
+                    "-i", str(source),
                     "-t", str(end - start),
 
                     # 保留原始畫面及存在時的音軌
@@ -1005,6 +1006,89 @@ def burn_subtitles():
 # Flask 本機啟動
 # Render 正式環境由 Gunicorn 啟動
 # ==========================================
+
+# ==========================================
+# 多段 MP3 旁白合併 API
+# POST /concat-audio
+# multipart/form-data: 多個 audio 欄位（依上傳順序）
+# 原有 /tts、/audio-info 與 /mix-narration 不變
+# ==========================================
+
+@app.post("/concat-audio")
+def concat_audio():
+    audio_files = request.files.getlist("audio")
+
+    if not 1 <= len(audio_files) <= 30:
+        return jsonify({
+            "error": "音訊片段數必須介於 1 至 30，且欄位名稱必須為 audio"
+        }), 400
+
+    try:
+        with TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            filenames = []
+
+            # 固定命名並保留 multipart 表單傳入的順序
+            for index, audio in enumerate(audio_files, 1):
+                name = f"part_{index:03d}.mp3"
+                path = folder / name
+                audio.save(path)
+
+                if path.stat().st_size < 100:
+                    return jsonify({
+                        "error": f"第 {index} 段 MP3 無效或內容為空"
+                    }), 400
+
+                filenames.append(name)
+
+            # FFmpeg concat demuxer 依清單順序拼接
+            concat_file = folder / "concat.txt"
+            concat_file.write_text(
+                "\n".join(
+                    f"file '{name}'" for name in filenames
+                ) + "\n",
+                encoding="utf-8"
+            )
+
+            output = folder / "narration.mp3"
+
+            # 重新編碼以統一音訊格式
+            subprocess.run(
+                [
+                    "ffmpeg", "-nostdin", "-hide_banner",
+                    "-loglevel", "error", "-y",
+                    "-f", "concat", "-safe", "0",
+                    "-i", str(concat_file),
+                    "-vn", "-map", "0:a:0",
+                    "-c:a", "libmp3lame",
+                    "-b:a", "128k", "-ar", "24000",
+                    str(output),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+
+            if not output.exists() or output.stat().st_size < 1024:
+                raise ValueError("合併後的 MP3 無效")
+
+            return send_file(
+                BytesIO(output.read_bytes()),
+                mimetype="audio/mpeg",
+                as_attachment=True,
+                download_name="narration.mp3",
+            )
+
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "MP3 合併處理逾時"}), 504
+
+    except (subprocess.CalledProcessError, OSError, ValueError):
+        app.logger.exception("MP3 concat failed")
+        return jsonify({
+            "error": "MP3 合併失敗，請檢查 Render Logs"
+        }), 500
+
 
 if __name__ == "__main__":
 
