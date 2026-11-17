@@ -1203,10 +1203,44 @@ def drive_file_info():
 
         if response.status_code != 200:
 
+            google_reason = "unknown"
+            google_error_status = "unknown"
+
+            try:
+                error_data = response.json().get("error", {})
+
+                if isinstance(error_data, dict):
+                    google_error_status = str(
+                        error_data.get("status", "unknown")
+                    )[:80]
+
+                    errors = error_data.get("errors", [])
+                    if isinstance(errors, list) and errors:
+                        first_error = errors[0]
+                        if isinstance(first_error, dict):
+                            google_reason = str(
+                                first_error.get("reason", "unknown")
+                            )[:100]
+
+                    if google_reason == "unknown":
+                        details = error_data.get("details", [])
+                        if isinstance(details, list):
+                            for detail in details:
+                                if isinstance(detail, dict):
+                                    reason = detail.get("reason")
+                                    if reason:
+                                        google_reason = str(reason)[:100]
+                                        break
+
+            except (ValueError, TypeError, AttributeError):
+                pass
+
             return jsonify({
                 "status": "error",
                 "error": "Google Drive metadata request failed",
-                "google_status": response.status_code
+                "google_status": response.status_code,
+                "google_reason": google_reason,
+                "google_error_status": google_error_status
             }), 502
 
         file_data = response.json()
