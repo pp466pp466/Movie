@@ -35,6 +35,7 @@ def check_api_key():
         "/mix-narration",
         "/burn-subtitles",
         "/drive-file-info",
+        "/drive-range-test",
     ):
         return
 
@@ -1272,6 +1273,114 @@ def drive_file_info():
             "status": "error",
             "error": "Google Drive connection failed"
         }), 502
+
+# ==========================================
+# Google Drive partial-download verification
+# Protected by the existing X-Editor-Key.
+# Reads at most 1 MiB of a fixed, approved test file.
+# Does not download the complete movie or run FFmpeg.
+# ==========================================
+
+@app.get("/drive-range-test")
+def drive_range_test():
+
+    test_file_id = "1HWBhQF5YR_lXk93Yt7QONqXvWyl6GwNv"
+    sample_size = 1024 * 1024
+
+    client_id = os.environ.get("GOOGLE_CLIENT_ID", "")
+    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+    refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+
+    if not all((client_id, client_secret, refresh_token)):
+        return jsonify({
+            "status": "error",
+            "error": "Google OAuth environment variables missing"
+        }), 503
+
+    try:
+        credentials = Credentials(
+            token=None,
+            refresh_token=refresh_token,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=client_id,
+            client_secret=client_secret,
+            scopes=[
+                "https://www.googleapis.com/auth/drive.readonly"
+            ]
+        )
+        credentials.refresh(GoogleAuthRequest())
+    except RefreshError:
+        return jsonify({
+            "status": "error",
+            "error": "Google OAuth token refresh failed"
+        }), 502
+
+    try:
+        # stream=True prevents loading the entire MP4 into memory.
+        with google_requests.get(
+            "https://www.googleapis.com/drive/v3/files/" + test_file_id,
+            params={"alt": "media"},
+            headers={
+                "Authorization": "Bearer " + credentials.token,
+                "Range": "bytes=0-1048575",
+                "Accept-Encoding": "identity"
+            },
+            stream=True,
+            timeout=(10, 30)
+        ) as response:
+
+            if response.status_code != 206:
+                # Do not consume the body if Google ignores Range.
+                return jsonify({
+                    "status": "error",
+                    "error": "Google Drive partial download failed",
+                    "google_status": response.status_code,
+                    "range_supported": False
+                }), 502
+
+            content_range = response.headers.get(
+                "Content-Range", ""
+            )
+
+            if not content_range.startswith("bytes 0-1048575/"):
+                return jsonify({
+                    "status": "error",
+                    "error": "Unexpected Google Drive content range",
+                    "google_status": response.status_code
+                }), 502
+
+            bytes_read = 0
+            for chunk in response.iter_content(chunk_size=65536):
+                bytes_read += len(chunk)
+                if bytes_read > sample_size:
+                    return jsonify({
+                        "status": "error",
+                        "error": "Partial response exceeded safe test size"
+                    }), 502
+
+            if bytes_read != sample_size:
+                return jsonify({
+                    "status": "error",
+                    "error": "Partial response was incomplete",
+                    "bytes_read": bytes_read
+                }), 502
+
+            return jsonify({
+                "status": "success",
+                "google_drive_connected": True,
+                "file_id": test_file_id,
+                "range_supported": True,
+                "google_status": response.status_code,
+                "content_range": content_range,
+                "bytes_read": bytes_read
+            })
+
+    except google_requests.RequestException:
+        return jsonify({
+            "status": "error",
+            "error": "Google Drive partial download connection failed"
+        }), 502
+
 
 if __name__ == "__main__":
 
