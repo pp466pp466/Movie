@@ -1113,6 +1113,132 @@ def concat_audio():
         }), 500
 
 
+# ==========================================
+# Google Drive OAuth 連線測試 API
+# 僅讀取指定測試影片的檔案資訊
+# 不下載影片、不執行 FFmpeg
+# ==========================================
+
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.auth.exceptions import RefreshError
+import requests as google_requests
+
+
+@app.get("/drive-file-info")
+def drive_file_info():
+
+    # 暫時只允許測試這支已確認的電影
+    test_file_id = (
+        "1HWBhQF5YR_lXk93Yt7QONqXvWyl6GwNv"
+    )
+
+    client_id = os.environ.get(
+        "GOOGLE_CLIENT_ID", ""
+    )
+
+    client_secret = os.environ.get(
+        "GOOGLE_CLIENT_SECRET", ""
+    )
+
+    refresh_token = os.environ.get(
+        "GOOGLE_REFRESH_TOKEN", ""
+    )
+
+    # 檢查 Render 環境變數
+    if not all([
+        client_id,
+        client_secret,
+        refresh_token
+    ]):
+        return jsonify({
+            "status": "error",
+            "error": "Google OAuth environment variables missing"
+        }), 503
+
+    try:
+
+        # 使用 Refresh Token 取得 Access Token
+        credentials = Credentials(
+            token=None,
+            refresh_token=refresh_token,
+            token_uri=(
+                "https://oauth2.googleapis.com/token"
+            ),
+            client_id=client_id,
+            client_secret=client_secret,
+            scopes=[
+                "https://www.googleapis.com/auth/drive.readonly"
+            ]
+        )
+
+        credentials.refresh(
+            GoogleAuthRequest()
+        )
+
+    except RefreshError:
+
+        # 不輸出憑證或 Google 回傳的敏感資料
+        return jsonify({
+            "status": "error",
+            "error": "Google OAuth token refresh failed"
+        }), 502
+
+    try:
+
+        # 只取得 metadata，不下載影片內容
+        response = google_requests.get(
+            "https://www.googleapis.com/drive/v3/files/"
+            + test_file_id,
+            headers={
+                "Authorization": (
+                    "Bearer " + credentials.token
+                )
+            },
+            params={
+                "fields": "id,name,mimeType,size"
+            },
+            timeout=(10, 30)
+        )
+
+        if response.status_code != 200:
+
+            return jsonify({
+                "status": "error",
+                "error": "Google Drive metadata request failed",
+                "google_status": response.status_code
+            }), 502
+
+        file_data = response.json()
+
+        size_bytes = int(
+            file_data.get("size", 0)
+        )
+
+        return jsonify({
+            "status": "success",
+            "google_drive_connected": True,
+            "file": {
+                "id": file_data.get("id"),
+                "name": file_data.get("name"),
+                "mime_type": file_data.get("mimeType"),
+                "size_bytes": size_bytes,
+                "size_mb": round(
+                    size_bytes / 1024 / 1024, 2
+                )
+            }
+        })
+
+    except (
+        google_requests.RequestException,
+        ValueError
+    ):
+
+        return jsonify({
+            "status": "error",
+            "error": "Google Drive connection failed"
+        }), 502
+
 if __name__ == "__main__":
 
     app.run(
