@@ -37,6 +37,7 @@ def check_api_key():
         "/drive-file-info",
         "/drive-range-test",
         "/drive-scenes-job",
+        "/drive-segment-job",
     ):
         return
 
@@ -1694,6 +1695,288 @@ def drive_scenes_job_status():
         }), 404
 
     return jsonify(status)
+
+
+# ==========================================
+# Drive segment scene detection (test version).
+# Only analyzes a selected 15-300 second interval.
+# Google Drive data is read by FFmpeg over HTTPS with Range seeks,
+# without writing the complete movie to the local disk.
+# Results remain in process memory until n8n saves a checkpoint.
+# ==========================================
+
+_segment_scene_lock = _scene_threading.Lock()
+_segment_scene_job = {"status": "idle"}
+
+
+def _segment_scene_update(job_id, **values):
+    with _segment_scene_lock:
+        if _segment_scene_job.get("job_id") == job_id:
+            _segment_scene_job.update(values)
+
+
+def _segment_scene_worker(job_id, start_sec, duration_sec, threshold):
+    process = None
+    try:
+        client_id = os.environ.get("GOOGLE_CLIENT_ID", "")
+        client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+        refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+        if not all((client_id, client_secret, refresh_token)):
+            raise ValueError("oauth_environment_missing")
+
+        credentials = Credentials(
+            token=None,
+            refresh_token=refresh_token,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=client_id,
+            client_secret=client_secret,
+            scopes=["https://www.googleapis.com/auth/drive.readonly"]
+        )
+        credentials.refresh(GoogleAuthRequest())
+
+        media_url = (
+            "https://www.googleapis.com/drive/v3/files/"
+            + _DRIVE_TEST_FILE_ID + "?alt=media"
+        )
+        # Never print command arguments: they contain an access token.
+        http_headers = (
+            "Authorization: Bearer " + credentials.token + "\r\n"
+            "Accept-Encoding: identity\r\n"
+        )
+
+        with TemporaryDirectory(prefix="segment_scene_") as temp_dir:
+            progress_file = Path(temp_dir) / "ffmpeg.progress"
+            stderr_file = Path(temp_dir) / "ffmpeg.stderr"
+
+            scene_filter = (
+                "setpts=PTS-STARTPTS,"
+                "scale=320:-2,"
+                f"select='gt(scene,{threshold})',"
+                "showinfo"
+            )
+            command = [
+                "ffmpeg", "-nostdin", "-hide_banner",
+                "-loglevel", "info",
+                "-stats_period", "5",
+                "-progress", str(progress_file),
+                "-threads", "1", "-filter_threads", "1",
+                "-rw_timeout", "30000000",
+                "-seekable", "1",
+                "-headers", http_headers,
+                "-ss", str(start_sec),
+                "-i", media_url,
+                "-map", "0:v:0",
+                "-t", str(duration_sec),
+                "-vf", scene_filter,
+                "-an", "-f", "null", "-"
+            ]
+
+            _segment_scene_update(
+                job_id, status="detecting_scenes",
+                progress_percent=0,
+                processed_sec=0
+            )
+
+            with stderr_file.open("w", encoding="utf-8") as errors:
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.DEVNULL,
+                    stderr=errors
+                )
+                deadline = _scene_time.monotonic() + 900
+
+                try:
+                    while process.poll() is None:
+                        if _scene_time.monotonic() > deadline:
+                            process.kill()
+                            process.wait(timeout=10)
+                            raise subprocess.TimeoutExpired(
+                                cmd="ffmpeg-segment", timeout=900
+                            )
+
+                        if progress_file.exists():
+                            progress_text = progress_file.read_text(
+                                encoding="utf-8", errors="replace"
+                            )
+                            matches = _scene_re.findall(
+                                r"out_time=(\d+):(\d+):(\d+(?:\.\d+)?)",
+                                progress_text
+                            )
+                            if matches:
+                                hours, minutes, seconds = matches[-1]
+                                processed = (
+                                    int(hours) * 3600
+                                    + int(minutes) * 60
+                                    + float(seconds)
+                                )
+                                processed = min(
+                                    duration_sec, max(0.0, processed)
+                                )
+                                _segment_scene_update(
+                                    job_id,
+                                    processed_sec=round(processed, 2),
+                                    progress_percent=round(
+                                        processed / duration_sec * 100, 1
+                                    )
+                                )
+
+                        _scene_time.sleep(4)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=10)
+
+            if process.returncode != 0:
+                # Only a fixed error code is exposed; no bearer token.
+                raise ValueError("ffmpeg_remote_segment_failed")
+
+            output_log = stderr_file.read_text(
+                encoding="utf-8", errors="replace"
+            )
+            relative_cuts = sorted(set(
+                round(float(match), 3)
+                for match in _scene_re.findall(
+                    r"pts_time:\s*([0-9]+(?:\.[0-9]+)?)",
+                    output_log
+                )
+                if 0 < float(match) < duration_sec
+            ))
+
+            end_sec = round(start_sec + duration_sec, 3)
+            cuts = [
+                round(start_sec + relative_time, 3)
+                for relative_time in relative_cuts
+            ]
+            # The segment edges are boundaries, NOT detected scene cuts.
+            boundaries = [round(start_sec, 3), *cuts, end_sec]
+            scenes = [
+                {
+                    "scene_index": index,
+                    "start_sec": boundaries[index],
+                    "end_sec": boundaries[index + 1],
+                    "duration_sec": round(
+                        boundaries[index + 1] - boundaries[index], 3
+                    )
+                }
+                for index in range(len(boundaries) - 1)
+            ]
+            _segment_scene_update(
+                job_id,
+                status="completed",
+                segment_start_sec=round(start_sec, 3),
+                segment_end_sec=end_sec,
+                segment_duration_sec=duration_sec,
+                threshold=threshold,
+                progress_percent=100,
+                processed_sec=duration_sec,
+                scene_count=len(scenes),
+                detected_cut_timestamps=cuts,
+                scene_boundaries=boundaries,
+                scene_edges_are_artificial=True,
+                scenes=scenes,
+                completed_at=int(_scene_time.time())
+            )
+
+    except RefreshError:
+        _segment_scene_update(
+            job_id, status="failed", error="oauth_refresh_failed"
+        )
+    except subprocess.TimeoutExpired:
+        _segment_scene_update(
+            job_id, status="failed", error="ffmpeg_segment_timeout"
+        )
+    except google_requests.RequestException:
+        _segment_scene_update(
+            job_id, status="failed", error="google_drive_request_failed"
+        )
+    except (ValueError, OSError, TypeError) as error:
+        code = str(error)
+        allowed = {
+            "oauth_environment_missing",
+            "ffmpeg_remote_segment_failed"
+        }
+        _segment_scene_update(
+            job_id, status="failed",
+            error=code if code in allowed else "segment_processing_failed"
+        )
+
+
+@app.post("/drive-segment-job")
+def drive_segment_job_start():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "JSON object required"}), 400
+
+    if data.get("file_id") != _DRIVE_TEST_FILE_ID:
+        return jsonify({"error": "File ID not allowlisted"}), 403
+
+    try:
+        start_sec = float(data.get("segment_start_sec", 0))
+        duration_sec = float(data.get("segment_duration_sec", 60))
+        threshold = float(data.get("threshold", 0.35))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid segment parameters"}), 400
+
+    if (
+        not all(map(math.isfinite, (start_sec, duration_sec, threshold)))
+        or not 0 <= start_sec <= 6500
+        or not 15 <= duration_sec <= 300
+        or start_sec + duration_sec > 6533.639
+        or not 0.1 <= threshold <= 0.8
+    ):
+        return jsonify({
+            "error": "Invalid segment interval or threshold"
+        }), 400
+
+    with _segment_scene_lock:
+        if _segment_scene_job.get("status") in (
+            "queued", "detecting_scenes"
+        ):
+            return jsonify({
+                "status": "busy",
+                "error": "Another segment job is running"
+            }), 409
+
+        job_id = _scene_uuid.uuid4().hex
+        _segment_scene_job.clear()
+        _segment_scene_job.update({
+            "job_id": job_id,
+            "status": "queued",
+            "file_id": _DRIVE_TEST_FILE_ID,
+            "segment_start_sec":round(start_sec, 3),
+            "segment_end_sec":round(start_sec + duration_sec, 3),
+            "segment_duration_sec":duration_sec,
+            "threshold": threshold,
+            "created_at": int(_scene_time.time())
+        })
+
+    worker = _scene_threading.Thread(
+        target=_segment_scene_worker,
+        args=(job_id, start_sec, duration_sec, threshold),
+        daemon=True
+    )
+    worker.start()
+
+    return jsonify({
+        "status": "queued",
+        "job_id": job_id,
+        "status_endpoint": "/drive-segment-job"
+    }), 202
+
+
+@app.get("/drive-segment-job")
+def drive_segment_job_status():
+    with _segment_scene_lock:
+        state = dict(_segment_scene_job)
+
+    requested_id = request.args.get("job_id")
+    if requested_id and requested_id != state.get("job_id"):
+        return jsonify({
+            "status": "not_found",
+            "error": "Job not found (possible service restart)"
+        }), 404
+
+    return jsonify(state)
 
 
 if __name__ == "__main__":
