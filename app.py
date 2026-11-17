@@ -36,6 +36,7 @@ def check_api_key():
         "/burn-subtitles",
         "/drive-file-info",
         "/drive-range-test",
+        "/drive-scenes-job",
     ):
         return
 
@@ -1380,6 +1381,319 @@ def drive_range_test():
             "status": "error",
             "error": "Google Drive partial download connection failed"
         }), 502
+
+
+# ==========================================
+# Drive scene detection: asynchronous test job
+# The source is downloaded directly from Google Drive
+# to a temporary file, never through an HTTP upload.
+# This is process-local test state, not durable storage.
+# ==========================================
+
+import re as _scene_re
+import shutil as _scene_shutil
+import threading as _scene_threading
+import time as _scene_time
+import uuid as _scene_uuid
+
+_DRIVE_TEST_FILE_ID = "1HWBhQF5YR_lXk93Yt7QONqXvWyl6GwNv"
+_drive_scene_lock = _scene_threading.Lock()
+_drive_scene_job = {"status": "idle"}
+
+
+def _drive_scene_update(job_id, **values):
+    with _drive_scene_lock:
+        if _drive_scene_job.get("job_id") == job_id:
+            _drive_scene_job.update(values)
+
+
+def _drive_scene_worker(job_id, threshold):
+    try:
+        client_id = os.environ.get("GOOGLE_CLIENT_ID", "")
+        client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+        refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+
+        if not all((client_id, client_secret, refresh_token)):
+            raise ValueError("oauth_environment_missing")
+
+        credentials = Credentials(
+            token=None,
+            refresh_token=refresh_token,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=client_id,
+            client_secret=client_secret,
+            scopes=["https://www.googleapis.com/auth/drive.readonly"]
+        )
+        credentials.refresh(GoogleAuthRequest())
+
+        headers = {
+            "Authorization": "Bearer " + credentials.token,
+            "Accept-Encoding": "identity"
+        }
+        url = (
+            "https://www.googleapis.com/drive/v3/files/"
+            + _DRIVE_TEST_FILE_ID
+        )
+
+        with google_requests.get(
+            url,
+            params={"fields": "id,name,mimeType,size,capabilities(canDownload)"},
+            headers=headers,
+            timeout=(15, 45)
+        ) as metadata_response:
+            if metadata_response.status_code != 200:
+                raise ValueError("drive_metadata_failed")
+            metadata = metadata_response.json()
+
+        if metadata.get("mimeType") != "video/mp4":
+            raise ValueError("not_an_mp4")
+        if not metadata.get("capabilities", {}).get("canDownload", False):
+            raise ValueError("drive_download_not_allowed")
+
+        expected_bytes = int(metadata.get("size", 0))
+        if expected_bytes < 1024 or expected_bytes > 1024 * 1024 * 1024:
+            raise ValueError("invalid_or_oversized_file")
+
+        with TemporaryDirectory(prefix="drive_scene_") as tmp:
+            folder = Path(tmp)
+            source = folder / "source.mp4"
+            free_bytes = _scene_shutil.disk_usage(folder).free
+            if free_bytes < expected_bytes + 256 * 1024 * 1024:
+                raise ValueError("insufficient_temporary_disk_space")
+
+            _drive_scene_update(
+                job_id,
+                status="downloading",
+                total_bytes=expected_bytes,
+                downloaded_bytes=0,
+                percentage=0
+            )
+
+            downloaded = 0
+            started_at = _scene_time.monotonic()
+
+            with google_requests.get(
+                url,
+                params={"alt": "media"},
+                headers=headers,
+                stream=True,
+                timeout=(15, 75)
+            ) as download_response:
+                if download_response.status_code != 200:
+                    raise ValueError("drive_media_download_failed")
+
+                with source.open("wb") as output:
+                    for chunk in download_response.iter_content(
+                        chunk_size=1024 * 1024
+                    ):
+                        if not chunk:
+                            continue
+                        downloaded += len(chunk)
+                        if downloaded > expected_bytes:
+                            raise ValueError("drive_size_mismatch")
+                        if _scene_time.monotonic() - started_at > 1800:
+                            raise ValueError("download_time_limit_exceeded")
+                        output.write(chunk)
+                        _drive_scene_update(
+                            job_id,
+                            downloaded_bytes=downloaded,
+                            percentage=round(
+                                downloaded / expected_bytes * 100, 1
+                            )
+                        )
+
+            if downloaded != expected_bytes:
+                raise ValueError("drive_download_incomplete")
+
+            _drive_scene_update(
+                job_id,
+                status="detecting_scenes",
+                downloaded_bytes=downloaded,
+                percentage=100
+            )
+
+            probe = subprocess.run(
+                [
+                    "ffprobe", "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    str(source)
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=60
+            )
+            duration = float(probe.stdout.strip())
+            if not math.isfinite(duration) or duration <= 0:
+                raise ValueError("invalid_video_duration")
+
+            scene_filter = (
+                "scale=320:-2,"
+                f"select='gt(scene,{threshold})',"
+                "showinfo"
+            )
+
+            ffmpeg_result = subprocess.run(
+                [
+                    "ffmpeg", "-nostdin", "-hide_banner",
+                    "-loglevel", "info",
+                    "-threads", "1",
+                    "-filter_threads", "1",
+                    "-i", str(source),
+                    "-map", "0:v:0",
+                    "-vf", scene_filter,
+                    "-an", "-f", "null", "-"
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=3600
+            )
+
+            timestamps = sorted(set(
+                round(float(x), 3)
+                for x in _scene_re.findall(
+                    r"pts_time:\s*([0-9]+(?:\.[0-9]+)?)",
+                    ffmpeg_result.stderr
+                )
+            ))
+
+            duration_rounded = round(duration, 3)
+            boundaries = [0.0]
+            for timestamp in timestamps:
+                if (
+                    0 < timestamp < duration_rounded
+                    and timestamp > boundaries[-1] + 0.001
+                ):
+                    boundaries.append(timestamp)
+            boundaries.append(duration_rounded)
+
+            scenes = [
+                {
+                    "scene_index": index,
+                    "start_sec": boundaries[index],
+                    "end_sec": boundaries[index + 1],
+                    "duration_sec": round(
+                        boundaries[index + 1] - boundaries[index], 3
+                    )
+                }
+                for index in range(len(boundaries) - 1)
+            ]
+
+            _drive_scene_update(
+                job_id,
+                status="completed",
+                duration_sec=round(duration, 3),
+                threshold=threshold,
+                scene_count=len(scenes),
+                scene_boundaries=boundaries,
+                scenes=scenes,
+                completed_at=int(_scene_time.time())
+            )
+
+    except RefreshError:
+        _drive_scene_update(
+            job_id, status="failed", error="oauth_refresh_failed"
+        )
+    except subprocess.TimeoutExpired:
+        _drive_scene_update(
+            job_id, status="failed", error="ffmpeg_timeout"
+        )
+    except google_requests.RequestException:
+        _drive_scene_update(
+            job_id, status="failed", error="google_drive_request_failed"
+        )
+    except subprocess.CalledProcessError:
+        _drive_scene_update(
+            job_id, status="failed", error="ffmpeg_processing_failed"
+        )
+    except (OSError, TypeError, ValueError, KeyError) as error:
+        safe_errors = {
+            "oauth_environment_missing",
+            "drive_metadata_failed",
+            "not_an_mp4",
+            "drive_download_not_allowed",
+            "invalid_or_oversized_file",
+            "insufficient_temporary_disk_space",
+            "drive_media_download_failed",
+            "drive_size_mismatch",
+            "download_time_limit_exceeded",
+            "drive_download_incomplete",
+            "invalid_video_duration"
+        }
+        code = str(error)
+        _drive_scene_update(
+            job_id,
+            status="failed",
+            error=code if code in safe_errors else "processing_error"
+        )
+
+
+@app.post("/drive-scenes-job")
+def drive_scenes_job_start():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "JSON object required"}), 400
+
+    if data.get("file_id") != _DRIVE_TEST_FILE_ID:
+        return jsonify({"error": "File ID not allowlisted"}), 403
+
+    try:
+        threshold = float(data.get("threshold", 0.35))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid threshold"}), 400
+
+    if not math.isfinite(threshold) or not 0.1 <= threshold <= 0.8:
+        return jsonify({"error": "Threshold must be 0.1 to 0.8"}), 400
+
+    with _drive_scene_lock:
+        if _drive_scene_job.get("status") in (
+            "queued", "downloading", "detecting_scenes"
+        ):
+            return jsonify({
+                "status": "busy",
+                "error": "Another Drive scene job is running"
+            }), 409
+
+        job_id = _scene_uuid.uuid4().hex
+        _drive_scene_job.clear()
+        _drive_scene_job.update({
+            "job_id": job_id,
+            "status": "queued",
+            "file_id": _DRIVE_TEST_FILE_ID,
+            "threshold": threshold,
+            "created_at": int(_scene_time.time()),
+            "downloaded_bytes": 0
+        })
+
+    worker = _scene_threading.Thread(
+        target=_drive_scene_worker,
+        args=(job_id, threshold),
+        daemon=True
+    )
+    worker.start()
+
+    return jsonify({
+        "status": "queued",
+        "job_id": job_id,
+        "status_endpoint": "/drive-scenes-job"
+    }), 202
+
+
+@app.get("/drive-scenes-job")
+def drive_scenes_job_status():
+    with _drive_scene_lock:
+        status = dict(_drive_scene_job)
+
+    requested_id = request.args.get("job_id")
+    if requested_id and requested_id != status.get("job_id"):
+        return jsonify({
+            "status": "not_found",
+            "error": "Job not found (possible service restart)"
+        }), 404
+
+    return jsonify(status)
 
 
 if __name__ == "__main__":
