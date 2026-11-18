@@ -84,9 +84,22 @@ def run_ffmpeg(command):
 @app.get("/health")
 def health():
 
+    job_store_status = "unconfigured"
+    if _JOB_BACKEND != "unconfigured":
+        try:
+            _job_init()
+            with _job_transaction() as conn:
+                conn.execute("SELECT 1").fetchone()
+            job_store_status = "ready"
+        except Exception:
+            job_store_status = "unavailable"
+            app.logger.exception("Health job store check failed")
+
     return jsonify({
         "status": "ok",
-        "service": "video-editor"
+        "service": "video-editor",
+        "job_store_backend": _JOB_BACKEND,
+        "job_store_status": job_store_status
     })
 
 
@@ -1397,15 +1410,251 @@ import threading as _scene_threading
 import time as _scene_time
 import uuid as _scene_uuid
 
+# ==========================================
+# Durable background job store for Drive jobs
+# Backends: PostgreSQL (DATABASE_URL) or SQLite on a mounted disk.
+# Render Free does NOT offer persistent disks. For Free, use external Postgres.
+# No store -> job POST/GET returns 503; do not silently use ephemeral memory.
+# ==========================================
+
+import sqlite3 as _jobs_sqlite
+from contextlib import contextmanager as _jobs_contextmanager
+
+_JOB_INSTANCE_ID = _scene_uuid.uuid4().hex
+_JOB_DATABASE_URL = (
+    os.environ.get("MOVIE_JOB_DATABASE_URL")
+    or os.environ.get("DATABASE_URL")
+    or ""
+).strip()
+_JOB_SQLITE_PATH = os.environ.get("MOVIE_JOB_SQLITE_PATH", "").strip()
+_JOB_BACKEND = (
+    "postgres" if _JOB_DATABASE_URL
+    else "sqlite" if _JOB_SQLITE_PATH
+    else "unconfigured"
+)
+_JOB_INIT_LOCK = _scene_threading.RLock()
+_JOB_READY = False
+_JOB_ACTIVE = ("queued", "downloading", "detecting_scenes")
+_JOB_TERMINAL = ("completed", "failed")
+
+
+def _job_sql(statement):
+    return statement.replace("?", "%s") if _JOB_BACKEND == "postgres" else statement
+
+
+def _job_conn_open():
+    if _JOB_BACKEND == "postgres":
+        import psycopg
+        return psycopg.connect(_JOB_DATABASE_URL, connect_timeout=10)
+    if _JOB_BACKEND == "sqlite":
+        db_path = Path(_JOB_SQLITE_PATH)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = _jobs_sqlite.connect(str(db_path), timeout=20)
+        connection.execute("PRAGMA busy_timeout=20000")
+        return connection
+    raise RuntimeError("durable_job_store_not_configured")
+
+
+@_jobs_contextmanager
+def _job_transaction(lock_writer=False):
+    conn = _job_conn_open()
+    try:
+        if _JOB_BACKEND == "sqlite" and lock_writer:
+            conn.execute("BEGIN IMMEDIATE")
+        elif _JOB_BACKEND == "postgres" and lock_writer:
+            # One transaction-wide lock prevents duplicate job creation across workers.
+            conn.execute("SELECT pg_advisory_xact_lock(58024011)")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _job_init():
+    global _JOB_READY
+    if _JOB_READY:
+        return
+    with _JOB_INIT_LOCK:
+        if _JOB_READY:
+            return
+        with _job_transaction() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS movie_line_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    job_kind TEXT NOT NULL,
+                    task_key TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    state_json TEXT NOT NULL,
+                    created_at BIGINT NOT NULL,
+                    updated_at BIGINT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_movie_line_jobs_lookup
+                ON movie_line_jobs (job_kind, task_key, created_at)
+            """)
+        _JOB_READY = True
+
+
+def _job_row(conn, where, params, order="created_at DESC, job_id DESC"):
+    sql = (
+        "SELECT state_json FROM movie_line_jobs WHERE " + where
+        + " ORDER BY " + order + " LIMIT 1"
+    )
+    row = conn.execute(_job_sql(sql), params).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def _job_put(conn, state):
+    # Every update preserves the whole JSON result, not just a status flag.
+    state["updated_at"] = int(_scene_time.time())
+    conn.execute(_job_sql("""
+        UPDATE movie_line_jobs
+        SET status = ?, state_json = ?, updated_at = ?
+        WHERE job_id = ?
+    """), (
+        state["status"], json.dumps(state, ensure_ascii=False),
+        state["updated_at"], state["job_id"]
+    ))
+
+
+def _job_recover_if_interrupted(conn, state):
+    if not state or state.get("status") not in _JOB_ACTIVE:
+        return state
+    # A daemon thread cannot survive process death. Never claim it is running
+    # after another Gunicorn process becomes the owner of this job store.
+    if state.get("_instance_id") != _JOB_INSTANCE_ID:
+        state["status"] = "failed"
+        state["error"] = "worker_interrupted_after_restart"
+        state["interrupted_at"] = int(_scene_time.time())
+        _job_put(conn, state)
+    return state
+
+
+def _job_create(kind, task_key, details):
+    _job_init()
+    with _job_transaction(lock_writer=True) as conn:
+        latest = _job_row(conn, "job_kind = ? AND task_key = ?", (kind, task_key))
+        if latest:
+            latest = _job_recover_if_interrupted(conn, latest)
+            if latest["status"] == "completed":
+                return "reused", latest
+            if latest["status"] in _JOB_ACTIVE:
+                return "reused", latest
+            # A previous worker was interrupted. Require a deliberate retry
+            # after the caller has verified that no checkpoint exists.
+            if latest.get("error") == "worker_interrupted_after_restart":
+                if not details.get("confirmed_checkpoint_missing", False):
+                    return "interrupted", latest
+
+        # Preserve the old one-at-a-time behavior for each endpoint type.
+        rows = conn.execute(_job_sql("""
+            SELECT state_json FROM movie_line_jobs
+            WHERE job_kind = ? AND status IN (?, ?, ?)
+            ORDER BY created_at DESC
+        """), (kind, *_JOB_ACTIVE)).fetchall()
+        for row in rows:
+            running = _job_recover_if_interrupted(conn, json.loads(row[0]))
+            if running["status"] in _JOB_ACTIVE:
+                return "busy", running
+
+        timestamp = int(_scene_time.time())
+        timestamp_ms = int(_scene_time.time() * 1000)
+        job_id = _scene_uuid.uuid4().hex
+        state = {
+            "job_id": job_id,
+            "status": "queued",
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "_instance_id": _JOB_INSTANCE_ID,
+            "_task_key": task_key,
+            **{k: v for k, v in details.items() if k != "confirmed_checkpoint_missing"}
+        }
+        conn.execute(_job_sql("""
+            INSERT INTO movie_line_jobs (
+                job_id, job_kind, task_key, status,
+                state_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """), (
+            job_id, kind, task_key, "queued",
+            json.dumps(state, ensure_ascii=False), timestamp_ms, timestamp_ms
+        ))
+        return "created", state
+
+
+def _job_update(job_id, **values):
+    try:
+        _job_init()
+        with _job_transaction(lock_writer=True) as conn:
+            state = _job_row(conn, "job_id = ?", (job_id,))
+            if not state or state.get("status") in _JOB_TERMINAL:
+                return
+            state.update(values)
+            _job_put(conn, state)
+        if values.get("status") in _JOB_TERMINAL:
+            app.logger.info("movie_job_finished job_id=%s status=%s", job_id, values["status"])
+    except Exception:
+        app.logger.exception("movie_job_update_failed job_id=%s", job_id)
+        # Do not leak credentials or accidentally report completion.
+        raise
+
+
+def _job_lookup(kind, job_id):
+    _job_init()
+    with _job_transaction(lock_writer=True) as conn:
+        if job_id:
+            state = _job_row(conn, "job_kind = ? AND job_id = ?", (kind, job_id))
+        else:
+            state = _job_row(conn, "job_kind = ?", (kind,))
+        return _job_recover_if_interrupted(conn, state)
+
+
+def _job_public(state):
+    if state is None:
+        return {"status": "idle"}
+    return {key: value for key, value in state.items() if not key.startswith("_")}
+
+
+def _job_no_store_response():
+    return jsonify({
+        "status": "storage_unavailable",
+        "error": "Durable job storage not configured",
+        "required": "MOVIE_JOB_DATABASE_URL or MOVIE_JOB_SQLITE_PATH"
+    }), 503
+
+
+def _job_store_error():
+    app.logger.exception("movie_job_store_error")
+    return jsonify({"status": "storage_unavailable", "error": "Job storage temporarily unavailable"}), 503
+
+
+def _job_api_response(outcome, state, endpoint):
+    payload = {
+        "job_id": state["job_id"],
+        "status": state["status"],
+        "status_endpoint": endpoint
+    }
+    if outcome == "created":
+        return jsonify(payload), 202
+    if outcome == "reused":
+        payload["reused"] = True
+        return jsonify(payload), 200
+    if outcome == "busy":
+        payload["error"] = "Another job of this kind is already running"
+        return jsonify(payload), 409
+    payload["error"] = "Previous job interrupted; check checkpoint before retry"
+    payload["retry_requires"] = "confirmed_checkpoint_missing: true"
+    return jsonify(payload), 409
+
+
 _DRIVE_TEST_FILE_ID = "1HWBhQF5YR_lXk93Yt7QONqXvWyl6GwNv"
-_drive_scene_lock = _scene_threading.Lock()
-_drive_scene_job = {"status": "idle"}
 
 
 def _drive_scene_update(job_id, **values):
-    with _drive_scene_lock:
-        if _drive_scene_job.get("job_id") == job_id:
-            _drive_scene_job.update(values)
+    _job_update(job_id, **values)
 
 
 def _drive_scene_worker(job_id, threshold):
@@ -1629,6 +1878,12 @@ def _drive_scene_worker(job_id, threshold):
             status="failed",
             error=code if code in safe_errors else "processing_error"
         )
+    except Exception:
+        app.logger.exception("Full scene worker failed job_id=%s", job_id)
+        try:
+            _drive_scene_update(job_id, status="failed", error="processing_error")
+        except Exception:
+            app.logger.exception("Could not persist full job status job_id=%s", job_id)
 
 
 @app.post("/drive-scenes-job")
@@ -1636,65 +1891,54 @@ def drive_scenes_job_start():
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "JSON object required"}), 400
-
     if data.get("file_id") != _DRIVE_TEST_FILE_ID:
         return jsonify({"error": "File ID not allowlisted"}), 403
-
     try:
         threshold = float(data.get("threshold", 0.35))
     except (TypeError, ValueError):
         return jsonify({"error": "Invalid threshold"}), 400
-
     if not math.isfinite(threshold) or not 0.1 <= threshold <= 0.8:
         return jsonify({"error": "Threshold must be 0.1 to 0.8"}), 400
+    if _JOB_BACKEND == "unconfigured":
+        return _job_no_store_response()
 
-    with _drive_scene_lock:
-        if _drive_scene_job.get("status") in (
-            "queued", "downloading", "detecting_scenes"
-        ):
-            return jsonify({
-                "status": "busy",
-                "error": "Another Drive scene job is running"
-            }), 409
-
-        job_id = _scene_uuid.uuid4().hex
-        _drive_scene_job.clear()
-        _drive_scene_job.update({
-            "job_id": job_id,
-            "status": "queued",
+    task_key = f"{_DRIVE_TEST_FILE_ID}:full:{threshold:.6g}"
+    try:
+        outcome, state = _job_create("full", task_key, {
             "file_id": _DRIVE_TEST_FILE_ID,
             "threshold": threshold,
-            "created_at": int(_scene_time.time()),
-            "downloaded_bytes": 0
+            "downloaded_bytes": 0,
+            "confirmed_checkpoint_missing": data.get("confirmed_checkpoint_missing") is True
         })
+    except Exception:
+        return _job_store_error()
 
-    worker = _scene_threading.Thread(
-        target=_drive_scene_worker,
-        args=(job_id, threshold),
-        daemon=True
-    )
-    worker.start()
-
-    return jsonify({
-        "status": "queued",
-        "job_id": job_id,
-        "status_endpoint": "/drive-scenes-job"
-    }), 202
+    if outcome == "created":
+        thread = _scene_threading.Thread(
+            target=_drive_scene_worker,
+            args=(state["job_id"], threshold),
+            daemon=True
+        )
+        try:
+            thread.start()
+        except Exception:
+            _drive_scene_update(state["job_id"], status="failed", error="thread_start_failed")
+            return jsonify({"error": "Could not start worker", "job_id": state["job_id"]}), 503
+        app.logger.info("movie_job_started kind=full job_id=%s", state["job_id"])
+    return _job_api_response(outcome, state, "/drive-scenes-job")
 
 
 @app.get("/drive-scenes-job")
 def drive_scenes_job_status():
-    with _drive_scene_lock:
-        status = dict(_drive_scene_job)
-
-    requested_id = request.args.get("job_id")
-    if requested_id and requested_id != status.get("job_id"):
-        return jsonify({
-            "status": "not_found",
-            "error": "Job not found (possible service restart)"
-        }), 404
-
-    return jsonify(status)
+    if _JOB_BACKEND == "unconfigured":
+        return _job_no_store_response()
+    try:
+        state = _job_lookup("full", request.args.get("job_id"))
+    except Exception:
+        return _job_store_error()
+    if state is None and request.args.get("job_id"):
+        return jsonify({"status": "not_found", "error": "Unknown job_id"}), 404
+    return jsonify(_job_public(state))
 
 
 # ==========================================
@@ -1702,17 +1946,11 @@ def drive_scenes_job_status():
 # Only analyzes a selected 15-300 second interval.
 # Google Drive data is read by FFmpeg over HTTPS with Range seeks,
 # without writing the complete movie to the local disk.
-# Results remain in process memory until n8n saves a checkpoint.
+# Results are stored in PostgreSQL or SQLite, including completed scenes.
 # ==========================================
 
-_segment_scene_lock = _scene_threading.Lock()
-_segment_scene_job = {"status": "idle"}
-
-
 def _segment_scene_update(job_id, **values):
-    with _segment_scene_lock:
-        if _segment_scene_job.get("job_id") == job_id:
-            _segment_scene_job.update(values)
+    _job_update(job_id, **values)
 
 
 def _segment_scene_worker(job_id, start_sec, duration_sec, threshold):
@@ -1899,6 +2137,12 @@ def _segment_scene_worker(job_id, start_sec, duration_sec, threshold):
             job_id, status="failed",
             error=code if code in allowed else "segment_processing_failed"
         )
+    except Exception:
+        app.logger.exception("Segment worker failed job_id=%s", job_id)
+        try:
+            _segment_scene_update(job_id, status="failed", error="segment_processing_failed")
+        except Exception:
+            app.logger.exception("Could not persist failed job status job_id=%s", job_id)
 
 
 @app.post("/drive-segment-job")
@@ -1906,7 +2150,6 @@ def drive_segment_job_start():
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "JSON object required"}), 400
-
     if data.get("file_id") != _DRIVE_TEST_FILE_ID:
         return jsonify({"error": "File ID not allowlisted"}), 403
 
@@ -1924,59 +2167,51 @@ def drive_segment_job_start():
         or start_sec + duration_sec > 6533.639
         or not 0.1 <= threshold <= 0.8
     ):
-        return jsonify({
-            "error": "Invalid segment interval or threshold"
-        }), 400
+        return jsonify({"error": "Invalid segment interval or threshold"}), 400
+    if _JOB_BACKEND == "unconfigured":
+        return _job_no_store_response()
 
-    with _segment_scene_lock:
-        if _segment_scene_job.get("status") in (
-            "queued", "detecting_scenes"
-        ):
-            return jsonify({
-                "status": "busy",
-                "error": "Another segment job is running"
-            }), 409
+    end_sec = round(start_sec + duration_sec, 3)
+    task_key = f"{_DRIVE_TEST_FILE_ID}:{start_sec:.6g}:{end_sec:.6g}:{threshold:.6g}"
+    details = {
+        "file_id": _DRIVE_TEST_FILE_ID,
+        "segment_start_sec": round(start_sec, 3),
+        "segment_end_sec": end_sec,
+        "segment_duration_sec": duration_sec,
+        "threshold": threshold,
+        "confirmed_checkpoint_missing": data.get("confirmed_checkpoint_missing") is True
+    }
+    try:
+        outcome, state = _job_create("segment", task_key, details)
+    except Exception:
+        return _job_store_error()
 
-        job_id = _scene_uuid.uuid4().hex
-        _segment_scene_job.clear()
-        _segment_scene_job.update({
-            "job_id": job_id,
-            "status": "queued",
-            "file_id": _DRIVE_TEST_FILE_ID,
-            "segment_start_sec":round(start_sec, 3),
-            "segment_end_sec":round(start_sec + duration_sec, 3),
-            "segment_duration_sec":duration_sec,
-            "threshold": threshold,
-            "created_at": int(_scene_time.time())
-        })
-
-    worker = _scene_threading.Thread(
-        target=_segment_scene_worker,
-        args=(job_id, start_sec, duration_sec, threshold),
-        daemon=True
-    )
-    worker.start()
-
-    return jsonify({
-        "status": "queued",
-        "job_id": job_id,
-        "status_endpoint": "/drive-segment-job"
-    }), 202
+    if outcome == "created":
+        thread = _scene_threading.Thread(
+            target=_segment_scene_worker,
+            args=(state["job_id"], start_sec, duration_sec, threshold),
+            daemon=True
+        )
+        try:
+            thread.start()
+        except Exception:
+            _segment_scene_update(state["job_id"], status="failed", error="thread_start_failed")
+            return jsonify({"error": "Could not start worker", "job_id": state["job_id"]}), 503
+        app.logger.info("movie_job_started kind=segment job_id=%s", state["job_id"])
+    return _job_api_response(outcome, state, "/drive-segment-job")
 
 
 @app.get("/drive-segment-job")
 def drive_segment_job_status():
-    with _segment_scene_lock:
-        state = dict(_segment_scene_job)
-
-    requested_id = request.args.get("job_id")
-    if requested_id and requested_id != state.get("job_id"):
-        return jsonify({
-            "status": "not_found",
-            "error": "Job not found (possible service restart)"
-        }), 404
-
-    return jsonify(state)
+    if _JOB_BACKEND == "unconfigured":
+        return _job_no_store_response()
+    try:
+        state = _job_lookup("segment", request.args.get("job_id"))
+    except Exception:
+        return _job_store_error()
+    if state is None and request.args.get("job_id"):
+        return jsonify({"status": "not_found", "error": "Unknown job_id"}), 404
+    return jsonify(_job_public(state))
 
 
 if __name__ == "__main__":
@@ -1986,3 +2221,4 @@ if __name__ == "__main__":
         port=5000,
         debug=False
     )
+
