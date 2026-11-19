@@ -1602,11 +1602,13 @@ def _job_update(job_id, **values):
         raise
 
 
-def _job_lookup(kind, job_id):
+def _job_lookup(kind, job_id=None, task_key=None):
     _job_init()
     with _job_transaction(lock_writer=True) as conn:
         if job_id:
             state = _job_row(conn, "job_kind = ? AND job_id = ?", (kind, job_id))
+        elif task_key:
+            state = _job_row(conn, "job_kind = ? AND task_key = ?", (kind, task_key))
         else:
             state = _job_row(conn, "job_kind = ?", (kind,))
         return _job_recover_if_interrupted(conn, state)
@@ -2205,12 +2207,23 @@ def drive_segment_job_start():
 def drive_segment_job_status():
     if _JOB_BACKEND == "unconfigured":
         return _job_no_store_response()
+
+    job_id = request.args.get("job_id")
+    task_key = request.args.get("task_key")
+    if job_id and task_key:
+        return jsonify({"error": "Provide only one of job_id or task_key"}), 400
+    if task_key and (
+        len(task_key) > 256
+        or not task_key.startswith(_DRIVE_TEST_FILE_ID + ":")
+    ):
+        return jsonify({"error": "Invalid task_key"}), 400
+
     try:
-        state = _job_lookup("segment", request.args.get("job_id"))
+        state = _job_lookup("segment", job_id=job_id, task_key=task_key)
     except Exception:
         return _job_store_error()
-    if state is None and request.args.get("job_id"):
-        return jsonify({"status": "not_found", "error": "Unknown job_id"}), 404
+    if state is None and (job_id or task_key):
+        return jsonify({"status": "not_found", "error": "Unknown job_id or task_key"}), 404
     return jsonify(_job_public(state))
 
 
