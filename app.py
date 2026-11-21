@@ -1955,7 +1955,7 @@ def _segment_scene_update(job_id, **values):
     _job_update(job_id, **values)
 
 
-def _segment_scene_worker(job_id, start_sec, duration_sec, threshold):
+def _segment_scene_worker(job_id, file_id, start_sec, duration_sec, threshold):
     process = None
     try:
         client_id = os.environ.get("GOOGLE_CLIENT_ID", "")
@@ -1976,7 +1976,7 @@ def _segment_scene_worker(job_id, start_sec, duration_sec, threshold):
 
         media_url = (
             "https://www.googleapis.com/drive/v3/files/"
-            + _DRIVE_TEST_FILE_ID + "?alt=media"
+            + file_id + "?alt=media"
         )
         # Never print command arguments: they contain an access token.
         http_headers = (
@@ -2147,13 +2147,21 @@ def _segment_scene_worker(job_id, start_sec, duration_sec, threshold):
             app.logger.exception("Could not persist failed job status job_id=%s", job_id)
 
 
+def _segment_time_key(value):
+    # n8n canonical representation: milliseconds, no trailing zeros.
+    return f"{value:.3f}".rstrip("0").rstrip(".")
+
+
 @app.post("/drive-segment-job")
 def drive_segment_job_start():
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "JSON object required"}), 400
-    if data.get("file_id") != _DRIVE_TEST_FILE_ID:
-        return jsonify({"error": "File ID not allowlisted"}), 403
+    file_id = data.get("file_id")
+    if not isinstance(file_id, str) or not _scene_re.fullmatch(
+        r"[A-Za-z0-9_-]{10,200}", file_id
+    ):
+        return jsonify({"error": "Invalid file_id"}), 400
 
     try:
         start_sec = float(data.get("segment_start_sec", 0))
@@ -2164,9 +2172,8 @@ def drive_segment_job_start():
 
     if (
         not all(map(math.isfinite, (start_sec, duration_sec, threshold)))
-        or not 0 <= start_sec <= 6500
+        or not 0 <= start_sec <= 86_400
         or not 15 <= duration_sec <= 300
-        or start_sec + duration_sec > 6533.639
         or not 0.1 <= threshold <= 0.8
     ):
         return jsonify({"error": "Invalid segment interval or threshold"}), 400
@@ -2174,9 +2181,9 @@ def drive_segment_job_start():
         return _job_no_store_response()
 
     end_sec = round(start_sec + duration_sec, 3)
-    task_key = f"{_DRIVE_TEST_FILE_ID}:{start_sec:.6g}:{end_sec:.6g}:{threshold:.6g}"
+    task_key = f"{file_id}:{_segment_time_key(start_sec)}:{_segment_time_key(end_sec)}:{threshold}"
     details = {
-        "file_id": _DRIVE_TEST_FILE_ID,
+        "file_id": file_id,
         "segment_start_sec": round(start_sec, 3),
         "segment_end_sec": end_sec,
         "segment_duration_sec": duration_sec,
@@ -2191,7 +2198,7 @@ def drive_segment_job_start():
     if outcome == "created":
         thread = _scene_threading.Thread(
             target=_segment_scene_worker,
-            args=(state["job_id"], start_sec, duration_sec, threshold),
+            args=(state["job_id"], file_id, start_sec, duration_sec, threshold),
             daemon=True
         )
         try:
@@ -2214,7 +2221,11 @@ def drive_segment_job_status():
         return jsonify({"error": "Provide only one of job_id or task_key"}), 400
     if task_key and (
         len(task_key) > 256
-        or not task_key.startswith(_DRIVE_TEST_FILE_ID + ":")
+        or not _scene_re.fullmatch(
+            r"[A-Za-z0-9_-]{10,200}:[0-9]+(?:\.[0-9]{1,3})?:"
+            r"[0-9]+(?:\.[0-9]{1,3})?:0\.[0-9]+",
+            task_key,
+        )
     ):
         return jsonify({"error": "Invalid task_key"}), 400
 
