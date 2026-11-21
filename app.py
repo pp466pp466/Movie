@@ -30,6 +30,7 @@ def check_api_key():
         "/extract-frames",
         "/detect-scenes",
         "/tts",
+        "/tts-timeline",
         "/audio-info",
         "/concat-audio",
         "/mix-narration",
@@ -773,6 +774,112 @@ def generate_tts():
     except Exception:
         app.logger.exception("TTS generation failed")
         return jsonify({"error": "TTS 服務暫時無法產生音訊"}), 502
+
+
+ 
+@app.post("/tts-timeline")
+def generate_tts_timeline():
+    """Generate one TTS clip per shot and pad each clip to its video window.
+
+    Returns one MP3 with clip-aligned narration.  Never cuts a spoken phrase.
+    Visual SRT is generated from the same caption texts and time windows by n8n.
+    """
+    import re
+    import time
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error":"JSON object required"}), 400
+    segments = data.get("captions")
+    voice = data.get("voice", "zh-TW-YunJheNeural")
+    rate = data.get("rate", "+0%")
+    if voice != "zh-TW-YunJheNeural":
+        return jsonify({"error":"timeline endpoint only supports the Taiwan male narrator"}), 400
+    if not isinstance(rate,str) or not re.fullmatch(r"[+-]\d{1,2}%",rate):
+        return jsonify({"error":"Invalid rate"}), 400
+    if not -50 <= int(rate[:-1]) <= 50:
+        return jsonify({"error":"Invalid rate range"}), 400
+    if not isinstance(segments,list) or not 1 <= len(segments) <= 30:
+        return jsonify({"error":"captions must contain 1 to 30 clips"}), 400
+    target = data.get("target_duration_sec")
+    try:
+        target = float(target)
+    except (ValueError, TypeError):
+        return jsonify({"error":"Invalid target duration"}), 400
+    if not math.isfinite(target) or not 3 <= target <= 900:
+        return jsonify({"error":"Target duration must be 3 to 900 seconds"}), 400
+    cursor = 0.0
+    prepared = []
+    total_chars = 0
+    for idx, seg in enumerate(segments, 1):
+        if not isinstance(seg,dict) or seg.get("clip_id") != idx:
+            return jsonify({"error":"Invalid clip_id sequence"}), 400
+        txt = seg.get("text")
+        if not isinstance(txt,str) or not txt.strip() or len(txt)>200:
+            return jsonify({"error":"Invalid caption text", "clip_id":idx}), 400
+        if any(c in txt for c in ("\x00", "\r", "\n")):
+            return jsonify({"error":"Caption contains control characters", "clip_id":idx}), 400
+        total_chars += len(txt)
+        try:
+            start, end = float(seg["start_sec"]),float(seg["end_sec"])
+        except (KeyError, ValueError, TypeError):
+            return jsonify({"error":"Invalid caption interval", "clip_id":idx}), 400
+        if not all(math.isfinite(x) for x in (start,end)) or abs(start-cursor)>0.01 or not 0.45 <= end-start <= 90:
+            return jsonify({"error":"Caption intervals must be contiguous and >=0.45s", "clip_id":idx}), 400
+        prepared.append((txt.strip(),round(end-start,3)))
+        cursor=end
+    if total_chars>1000 or abs(cursor-target)>0.01:
+        return jsonify({"error":"Timeline text length or total duration mismatch"}), 400
+    try:
+        import edge_tts
+        from edge_tts.exceptions import NoAudioReceived
+        with TemporaryDirectory(prefix="storyteller_tts_") as tmp:
+            dirp=Path(tmp)
+            wavs=[]
+            for idx,(text,window_sec) in enumerate(prepared,1):
+                raw=dirp/f"voice_{idx:03d}.mp3"
+                wav=dirp/f"aligned_{idx:03d}.wav"
+                for attempt in range(3):
+                    try:
+                        raw.unlink(missing_ok=True)
+                        edge_tts.Communicate(text,voice=voice,rate=rate).save_sync(str(raw))
+                        break
+                    except NoAudioReceived:
+                        if attempt==2: raise
+                        time.sleep((2,5)[attempt])
+                info=probe_media_info(raw)
+                actual=info["duration_sec"]
+                available=window_sec-0.14
+                tempo=max(1.0,actual/max(available,0.1))
+                if tempo>1.35:
+                    return jsonify({"error":"narration_too_long_for_clip",
+                                    "clip_id":idx,"speech_duration_sec":actual,
+                                    "clip_duration_sec":window_sec,
+                                    "max_tempo":1.35}),422
+                audio_filter=f"atempo={tempo:.5f},apad,atrim=duration={window_sec:.3f},asetpts=PTS-STARTPTS"
+                subprocess.run([
+                    "ffmpeg","-nostdin","-hide_banner","-loglevel","error","-y",
+                    "-i",str(raw),"-vn","-af",audio_filter,
+                    "-ar","24000","-ac","1","-c:a","pcm_s16le",str(wav)
+                ],check=True,capture_output=True,text=True,timeout=90)
+                wavs.append(wav.name)
+            concat_file=dirp/"clips.txt"
+            concat_file.write_text("".join(f"file '{f}'\n" for f in wavs),encoding="utf-8")
+            out=dirp/"male_storyteller_timeline.mp3"
+            subprocess.run([
+                "ffmpeg","-nostdin","-hide_banner","-loglevel","error","-y",
+                "-f","concat","-safe","0","-i",str(concat_file),
+                "-t",f"{target-0.08:.3f}","-vn","-ar","24000","-ac","1",
+                "-c:a","libmp3lame","-b:a","128k",str(out)
+            ],check=True,capture_output=True,text=True,timeout=120)
+            if not out.is_file() or out.stat().st_size<1024:
+                raise ValueError("Invalid timeline MP3")
+            return send_file(BytesIO(out.read_bytes()),mimetype="audio/mpeg",
+                             as_attachment=True,download_name="male_storyteller_timeline.mp3")
+    except subprocess.TimeoutExpired:
+        return jsonify({"error":"timeline_ffmpeg_timeout"}),504
+    except Exception:
+        app.logger.exception("TTS timeline generation failed")
+        return jsonify({"error":"timeline_tts_failed"}),502
 
 
 # ==========================================
