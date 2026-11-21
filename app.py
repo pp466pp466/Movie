@@ -30,7 +30,6 @@ def check_api_key():
         "/extract-frames",
         "/detect-scenes",
         "/tts",
-        "/tts-timeline",
         "/audio-info",
         "/concat-audio",
         "/mix-narration",
@@ -39,6 +38,7 @@ def check_api_key():
         "/drive-range-test",
         "/drive-scenes-job",
         "/drive-segment-job",
+        "/drive-extract-frames",
     ):
         return
 
@@ -774,112 +774,6 @@ def generate_tts():
     except Exception:
         app.logger.exception("TTS generation failed")
         return jsonify({"error": "TTS 服務暫時無法產生音訊"}), 502
-
-
- 
-@app.post("/tts-timeline")
-def generate_tts_timeline():
-    """Generate one TTS clip per shot and pad each clip to its video window.
-
-    Returns one MP3 with clip-aligned narration.  Never cuts a spoken phrase.
-    Visual SRT is generated from the same caption texts and time windows by n8n.
-    """
-    import re
-    import time
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        return jsonify({"error":"JSON object required"}), 400
-    segments = data.get("captions")
-    voice = data.get("voice", "zh-TW-YunJheNeural")
-    rate = data.get("rate", "+0%")
-    if voice != "zh-TW-YunJheNeural":
-        return jsonify({"error":"timeline endpoint only supports the Taiwan male narrator"}), 400
-    if not isinstance(rate,str) or not re.fullmatch(r"[+-]\d{1,2}%",rate):
-        return jsonify({"error":"Invalid rate"}), 400
-    if not -50 <= int(rate[:-1]) <= 50:
-        return jsonify({"error":"Invalid rate range"}), 400
-    if not isinstance(segments,list) or not 1 <= len(segments) <= 30:
-        return jsonify({"error":"captions must contain 1 to 30 clips"}), 400
-    target = data.get("target_duration_sec")
-    try:
-        target = float(target)
-    except (ValueError, TypeError):
-        return jsonify({"error":"Invalid target duration"}), 400
-    if not math.isfinite(target) or not 3 <= target <= 900:
-        return jsonify({"error":"Target duration must be 3 to 900 seconds"}), 400
-    cursor = 0.0
-    prepared = []
-    total_chars = 0
-    for idx, seg in enumerate(segments, 1):
-        if not isinstance(seg,dict) or seg.get("clip_id") != idx:
-            return jsonify({"error":"Invalid clip_id sequence"}), 400
-        txt = seg.get("text")
-        if not isinstance(txt,str) or not txt.strip() or len(txt)>200:
-            return jsonify({"error":"Invalid caption text", "clip_id":idx}), 400
-        if any(c in txt for c in ("\x00", "\r", "\n")):
-            return jsonify({"error":"Caption contains control characters", "clip_id":idx}), 400
-        total_chars += len(txt)
-        try:
-            start, end = float(seg["start_sec"]),float(seg["end_sec"])
-        except (KeyError, ValueError, TypeError):
-            return jsonify({"error":"Invalid caption interval", "clip_id":idx}), 400
-        if not all(math.isfinite(x) for x in (start,end)) or abs(start-cursor)>0.01 or not 0.45 <= end-start <= 90:
-            return jsonify({"error":"Caption intervals must be contiguous and >=0.45s", "clip_id":idx}), 400
-        prepared.append((txt.strip(),round(end-start,3)))
-        cursor=end
-    if total_chars>1000 or abs(cursor-target)>0.01:
-        return jsonify({"error":"Timeline text length or total duration mismatch"}), 400
-    try:
-        import edge_tts
-        from edge_tts.exceptions import NoAudioReceived
-        with TemporaryDirectory(prefix="storyteller_tts_") as tmp:
-            dirp=Path(tmp)
-            wavs=[]
-            for idx,(text,window_sec) in enumerate(prepared,1):
-                raw=dirp/f"voice_{idx:03d}.mp3"
-                wav=dirp/f"aligned_{idx:03d}.wav"
-                for attempt in range(3):
-                    try:
-                        raw.unlink(missing_ok=True)
-                        edge_tts.Communicate(text,voice=voice,rate=rate).save_sync(str(raw))
-                        break
-                    except NoAudioReceived:
-                        if attempt==2: raise
-                        time.sleep((2,5)[attempt])
-                info=probe_media_info(raw)
-                actual=info["duration_sec"]
-                available=window_sec-0.14
-                tempo=max(1.0,actual/max(available,0.1))
-                if tempo>1.35:
-                    return jsonify({"error":"narration_too_long_for_clip",
-                                    "clip_id":idx,"speech_duration_sec":actual,
-                                    "clip_duration_sec":window_sec,
-                                    "max_tempo":1.35}),422
-                audio_filter=f"atempo={tempo:.5f},apad,atrim=duration={window_sec:.3f},asetpts=PTS-STARTPTS"
-                subprocess.run([
-                    "ffmpeg","-nostdin","-hide_banner","-loglevel","error","-y",
-                    "-i",str(raw),"-vn","-af",audio_filter,
-                    "-ar","24000","-ac","1","-c:a","pcm_s16le",str(wav)
-                ],check=True,capture_output=True,text=True,timeout=90)
-                wavs.append(wav.name)
-            concat_file=dirp/"clips.txt"
-            concat_file.write_text("".join(f"file '{f}'\n" for f in wavs),encoding="utf-8")
-            out=dirp/"male_storyteller_timeline.mp3"
-            subprocess.run([
-                "ffmpeg","-nostdin","-hide_banner","-loglevel","error","-y",
-                "-f","concat","-safe","0","-i",str(concat_file),
-                "-t",f"{target-0.08:.3f}","-vn","-ar","24000","-ac","1",
-                "-c:a","libmp3lame","-b:a","128k",str(out)
-            ],check=True,capture_output=True,text=True,timeout=120)
-            if not out.is_file() or out.stat().st_size<1024:
-                raise ValueError("Invalid timeline MP3")
-            return send_file(BytesIO(out.read_bytes()),mimetype="audio/mpeg",
-                             as_attachment=True,download_name="male_storyteller_timeline.mp3")
-    except subprocess.TimeoutExpired:
-        return jsonify({"error":"timeline_ffmpeg_timeout"}),504
-    except Exception:
-        app.logger.exception("TTS timeline generation failed")
-        return jsonify({"error":"timeline_tts_failed"}),502
 
 
 # ==========================================
@@ -2257,6 +2151,109 @@ def _segment_scene_worker(job_id, file_id, start_sec, duration_sec, threshold):
 def _segment_time_key(value):
     # n8n canonical representation: milliseconds, no trailing zeros.
     return f"{value:.3f}".rstrip("0").rstrip(".")
+
+
+@app.post("/drive-extract-frames")
+def drive_extract_frames():
+    """Extract one or two JPEG frames via authenticated Drive HTTP seeking.
+
+    Does not download the original movie to the local filesystem.
+    Read-only. Does not mutate FFmpeg jobs, Checkpoints, or Drive files.
+    """
+    import re
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "JSON object required"}), 400
+    file_id = data.get("file_id")
+    if not isinstance(file_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{10,200}", file_id):
+        return jsonify({"error": "Invalid file_id"}), 400
+    stamps = data.get("timestamps_sec")
+    # Gunicorn currently has a 180-second timeout. Avoid six long remote seeks
+    # in a single synchronous request; start by validating up to two frames.
+    if not isinstance(stamps, list) or not 1 <= len(stamps) <= 2:
+        return jsonify({"error": "timestamps_sec must contain 1 or 2 timestamps"}), 400
+    if any(type(t) not in (float, int) or not math.isfinite(t) or t < 0 or t > 86400
+           for t in stamps):
+        return jsonify({"error": "Invalid timestamp"}), 400
+    if len(stamps) == 2 and abs(float(stamps[0]) - float(stamps[1])) < 0.005:
+        return jsonify({"error": "Timestamps must be distinct"}), 400
+    width = data.get("max_width", 640)
+    if type(width) is not int or width not in (320, 480, 640):
+        return jsonify({"error": "max_width must be 320, 480 or 640"}), 400
+
+    client_id = os.environ.get("GOOGLE_CLIENT_ID", "")
+    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+    refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+    if not all((client_id, client_secret, refresh_token)):
+        return jsonify({"error": "oauth_environment_missing"}), 503
+    try:
+        credentials = Credentials(
+            token=None, refresh_token=refresh_token,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=client_id, client_secret=client_secret,
+            scopes=["https://www.googleapis.com/auth/drive.readonly"]
+        )
+        credentials.refresh(GoogleAuthRequest())
+    except Exception:
+        # Do not log the Google tokens, refresh result, or request headers.
+        return jsonify({"error": "oauth_refresh_failed"}), 502
+
+    media_root = "https://www.googleapis.com/drive/v3/files/" + file_id
+    auth_header = "Authorization: Bearer " + credentials.token + "\r\nAccept-Encoding: identity\r\n"
+    try:
+        metadata = google_requests.get(
+            media_root,
+            params={"fields": "id,mimeType,size", "supportsAllDrives": "true"},
+            headers={"Authorization": "Bearer " + credentials.token},
+            timeout=(8, 15)
+        )
+        if metadata.status_code != 200:
+            return jsonify({"error": "drive_metadata_failed"}), 502
+        if metadata.json().get("mimeType") != "video/mp4":
+            return jsonify({"error": "source_is_not_mp4"}), 400
+    except Exception:
+        return jsonify({"error": "drive_metadata_unavailable"}), 502
+
+    images = []
+    with TemporaryDirectory(prefix="drive_frame_smoke_") as tmp:
+        for idx, sec in enumerate(stamps):
+            target = Path(tmp) / ("frame_%02d.jpg" % idx)
+            command = [
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                "-threads", "1", "-filter_threads", "1",
+                "-rw_timeout", "30000000", "-seekable", "1",
+                "-headers", auth_header, "-ss", "%.3f" % float(sec),
+                "-i", media_root + "?alt=media", "-map", "0:v:0",
+                "-frames:v", "1", "-vf", "scale=%d:-2" % width,
+                "-q:v", "5", "-update", "1", str(target)
+            ]
+            # Never log command: it contains a short-lived Google access token.
+            try:
+                p = subprocess.run(
+                    command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=65, check=False
+                )
+            except subprocess.TimeoutExpired:
+                return jsonify({"error": "remote_seek_timeout", "sample_index": idx}), 504
+            except OSError:
+                return jsonify({"error": "ffmpeg_not_available"}), 502
+            if p.returncode != 0 or not target.is_file():
+                return jsonify({"error": "remote_frame_extraction_failed", "sample_index": idx}), 502
+            payload = target.read_bytes()
+            if not payload.startswith(b"\xff\xd8\xff") or not 1024 <= len(payload) <= 800000:
+                return jsonify({"error": "invalid_extracted_jpeg", "sample_index": idx}), 502
+            images.append({
+                "sample_index": idx,
+                "timestamp_sec": round(float(sec), 3),
+                "mime_type": "image/jpeg",
+                "byte_count": len(payload),
+                "image_base64": base64.b64encode(payload).decode("ascii")
+            })
+    return jsonify({
+        "status": "remote_frames_extracted", "file_id": file_id,
+        "frame_count": len(images), "source_mode": "drive_authenticated_seek",
+        "frames": images, "checkpoint_modified": False
+    })
 
 
 @app.post("/drive-segment-job")
