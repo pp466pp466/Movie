@@ -2595,7 +2595,7 @@ def drive_edit_chapter():
         return jsonify({'error': 'drive_metadata_unavailable'}), 502
 
     # 請勿記錄 ffmpeg cmd；Authorization header 內含短期憑證。
-    auth_header = 'Authorization: Bearer '+creds.token+'\\r\\nAccept-Encoding: identity\\r\\n'
+    auth_header = 'Authorization: Bearer '+creds.token+'\r\nAccept-Encoding: identity\r\n'
     with TemporaryDirectory(prefix='drive_chapter_') as temp:
         folder = Path(temp)
         def render_one(record):
@@ -2630,7 +2630,7 @@ def drive_edit_chapter():
             if error:
                 return jsonify({'error':error,'clip_index':index}), 504 if error=='remote_clip_timeout' else 502
         playlist = folder / 'concat.txt'
-        playlist.write_text(''.join("file '%s'\\n" % r[2].name for r in rendered), encoding='utf-8')
+        playlist.write_text(''.join("file '%s'\n" % r[2].name for r in rendered), encoding='utf-8')
         out = folder / 'chapter.mp4'
         try:
             p = subprocess.run([
