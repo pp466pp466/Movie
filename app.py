@@ -40,6 +40,8 @@ def check_api_key():
         "/drive-segment-job",
         "/drive-extract-frames",
         "/drive-extract-audio",
+        "/drive-edit-preview",
+        "/tts-timeline",
     ):
         return
 
@@ -2419,6 +2421,217 @@ def drive_segment_job_status():
         return jsonify({"status": "not_found", "error": "Unknown job_id or task_key"}), 404
     return jsonify(_job_public(state))
 
+
+@app.post('/drive-edit-preview')
+def drive_edit_preview():
+    """從 Google Drive 直接遠端 seek，拼接最多 4 段小片，回傳 MP4。
+
+    不下載整支電影、不修改 Google Drive、不寫入 FFmpeg 工作狀態。
+    POST JSON {"file_id":"...", "clips":[{"start_sec":30,"end_sec":45},...]}
+    必須由 check_api_key() 驗證 X-Editor-Key。
+    """
+    import re
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'json_object_required'}), 400
+    fid = payload.get('file_id')
+    if not isinstance(fid, str) or not re.fullmatch(r'[A-Za-z0-9_-]{10,200}', fid):
+        return jsonify({'error': 'invalid_file_id'}), 400
+    clips = payload.get('clips')
+    if not isinstance(clips, list) or not 1 <= len(clips) <= 4:
+        return jsonify({'error': 'clips_must_have_1_to_4_items'}), 400
+    intervals = []
+    total = 0.0
+    for index, clip in enumerate(clips, 1):
+        if not isinstance(clip, dict):
+            return jsonify({'error': 'invalid_clip', 'clip_index': index}), 400
+        a, b = clip.get('start_sec'), clip.get('end_sec')
+        if type(a) not in (int, float) or type(b) not in (int, float):
+            return jsonify({'error': 'invalid_clip_number', 'clip_index': index}), 400
+        if not math.isfinite(a) or not math.isfinite(b) or not 0 <= a < b <= 86400 or not 3 <= b-a <= 20:
+            return jsonify({'error': 'invalid_clip_interval', 'clip_index': index}), 400
+        total += b - a
+        intervals.append((float(a), float(b)))
+    if not 3 <= total <= 75:
+        return jsonify({'error': 'preview_duration_must_be_3_to_75_sec'}), 400
+    if any(intervals[i][0] < intervals[i-1][1] - 0.001 for i in range(1, len(intervals))):
+        return jsonify({'error': 'clips_must_be_sorted_and_non_overlapping'}), 400
+
+    cid = os.environ.get('GOOGLE_CLIENT_ID', '')
+    secret = os.environ.get('GOOGLE_CLIENT_SECRET', '')
+    refresh = os.environ.get('GOOGLE_REFRESH_TOKEN', '')
+    if not all((cid, secret, refresh)):
+        return jsonify({'error': 'oauth_environment_missing'}), 503
+    try:
+        creds = Credentials(
+            token=None, refresh_token=refresh,
+            token_uri='https://oauth2.googleapis.com/token',
+            client_id=cid, client_secret=secret,
+            scopes=['https://www.googleapis.com/auth/drive.readonly'])
+        creds.refresh(GoogleAuthRequest())
+    except Exception:
+        return jsonify({'error': 'oauth_refresh_failed'}), 502
+
+    root = 'https://www.googleapis.com/drive/v3/files/' + fid
+    try:
+        metadata = google_requests.get(
+            root, params={'fields': 'id,mimeType,size', 'supportsAllDrives': 'true'},
+            headers={'Authorization': 'Bearer ' + creds.token},
+            timeout=(8, 15))
+        if metadata.status_code != 200:
+            return jsonify({'error': 'drive_metadata_failed'}), 502
+        if metadata.json().get('mimeType') != 'video/mp4':
+            return jsonify({'error': 'source_is_not_mp4'}), 400
+    except Exception:
+        return jsonify({'error': 'drive_metadata_unavailable'}), 502
+
+    # 不可在任何日誌打印 cmd，因為暫時性的 Google Bearer Token 會在 headers 參數中。
+    header = 'Authorization: Bearer ' + creds.token + '\r\nAccept-Encoding: identity\r\n'
+    with TemporaryDirectory(prefix='drive_preview_') as folder_name:
+        folder = Path(folder_name)
+        segments = []
+        for idx, (start, end) in enumerate(intervals, 1):
+            dest = folder / ('part_%02d.mp4' % idx)
+            cmd = [
+                'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+                '-threads', '1', '-filter_threads', '1',
+                '-rw_timeout', '30000000', '-seekable', '1',
+                '-headers', header, '-ss', ('%.3f' % start),
+                '-i', root + '?alt=media',
+                '-t', ('%.3f' % (end-start)),
+                '-map', '0:v:0', '-map', '0:a:0',
+                '-vf', 'scale=960:-2', '-r', '24',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '27',
+                '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '96k',
+                '-movflags', '+faststart', str(dest)
+            ]
+            try:
+                proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL, timeout=34, check=False)
+            except subprocess.TimeoutExpired:
+                return jsonify({'error': 'remote_clip_timeout', 'clip_index': idx}), 504
+            except OSError:
+                return jsonify({'error': 'ffmpeg_unavailable'}), 502
+            if proc.returncode != 0 or not dest.is_file() or dest.stat().st_size < 1024:
+                return jsonify({'error': 'remote_clip_failed', 'clip_index': idx}), 502
+            segments.append(dest)
+        playlist = folder / 'concat.txt'
+        playlist.write_text(''.join("file '%s'\n" % p.name for p in segments), encoding='utf-8')
+        output = folder / 'preview.mp4'
+        try:
+            proc = subprocess.run([
+                'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+                '-f', 'concat', '-safe', '0', '-i', str(playlist),
+                '-c', 'copy', '-movflags', '+faststart', str(output)
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=20, check=False)
+        except subprocess.TimeoutExpired:
+            return jsonify({'error': 'preview_concat_timeout'}), 504
+        if proc.returncode != 0 or not output.exists():
+            return jsonify({'error': 'preview_concat_failed'}), 502
+        result = output.read_bytes()
+        if not 2048 < len(result) <= 70 * 1024 * 1024:
+            return jsonify({'error': 'preview_size_invalid'}), 502
+        return send_file(BytesIO(result), mimetype='video/mp4',
+                         as_attachment=True, download_name='movie_line_001_preview.mp4')
+
+
+@app.post('/tts-timeline')
+def tts_timeline():
+    """分段男聲 TTS，各段不足時以靜音補足，禁止截斷旁白。
+
+    POST JSON {"captions":[{"clip_id":1,"text":"...","start_sec":0,"end_sec":15},...],
+               "target_duration_sec":60,"voice":"zh-TW-YunJheNeural","rate":"+0%"}
+    回傳對齊單一 MP3，供現有 /audio-info 與 /mix-narration 直接使用。
+    """
+    import re
+    try:
+        import edge_tts
+    except ImportError:
+        return jsonify({'error': 'edge_tts_not_installed'}), 503
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': 'json_object_required'}), 400
+    caps = data.get('captions')
+    if not isinstance(caps, list) or not 1 <= len(caps) <= 8:
+        return jsonify({'error': 'captions_must_have_1_to_8_items'}), 400
+    voice = data.get('voice', 'zh-TW-YunJheNeural')
+    if voice not in ('zh-TW-YunJheNeural', 'zh-TW-HsiaoChenNeural'):
+        return jsonify({'error': 'voice_not_supported'}), 400
+    rate = data.get('rate', '+0%')
+    if not isinstance(rate, str) or not re.fullmatch(r'[+-]\d{1,2}%', rate) or not -50 <= int(rate[:-1]) <= 50:
+        return jsonify({'error': 'invalid_tts_rate'}), 400
+    target = data.get('target_duration_sec')
+    if type(target) not in (int, float) or not math.isfinite(target) or not 3 <= target <= 80:
+        return jsonify({'error': 'invalid_target_duration'}), 400
+    last_end = 0.0
+    specs = []
+    for i, cap in enumerate(caps, 1):
+        if not isinstance(cap, dict) or cap.get('clip_id') != i:
+            return jsonify({'error': 'clip_id_not_sequential', 'clip_index': i}), 400
+        txt, start, end = cap.get('text'), cap.get('start_sec'), cap.get('end_sec')
+        if not isinstance(txt, str) or not txt.strip() or len(txt) > 110:
+            return jsonify({'error': 'invalid_caption', 'clip_index': i}), 400
+        if type(start) not in (int, float) or type(end) not in (int, float):
+            return jsonify({'error': 'invalid_caption_interval', 'clip_index': i}), 400
+        if not all(math.isfinite(z) for z in (start, end)) or abs(start-last_end) > 0.005 or not end > start or end-start > 25:
+            return jsonify({'error': 'caption_timeline_gap_or_overlap', 'clip_index': i}), 400
+        specs.append((txt.strip(), float(end-start)))
+        last_end = float(end)
+    if abs(last_end-float(target)) > 0.005:
+        return jsonify({'error': 'caption_duration_total_mismatch'}), 400
+
+    with TemporaryDirectory(prefix='tts_timeline_') as name:
+        folder = Path(name)
+        wav_files = []
+        for i, (txt, slot) in enumerate(specs, 1):
+            mp3 = folder / ('part_%02d.mp3' % i)
+            wav = folder / ('part_%02d.wav' % i)
+            try:
+                edge_tts.Communicate(txt, voice=voice, rate=rate).save_sync(str(mp3))
+                info = probe_media_info(mp3)
+            except Exception:
+                app.logger.exception('Timeline TTS generation failure')
+                return jsonify({'error': 'tts_generation_failed', 'clip_index': i}), 502
+            spoken = info['duration_sec']
+            if spoken > slot - 0.10:
+                return jsonify({'error': 'caption_audio_exceeds_slot',
+                                'clip_index': i, 'audio_duration_sec': spoken,
+                                'slot_duration_sec': round(slot, 3)}), 422
+            # 先產生正確長度的有聲+靜音 WAV，避免接段時 MP3 encoder delay 使旁白偏移。
+            try:
+                proc = subprocess.run([
+                    'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+                    '-i', str(mp3), '-af', 'apad,atrim=duration=%.3f' % slot,
+                    '-ar', '24000', '-ac', '1', '-c:a', 'pcm_s16le', str(wav)
+                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=30, check=False)
+            except subprocess.TimeoutExpired:
+                return jsonify({'error': 'tts_padding_timeout', 'clip_index': i}), 504
+            if proc.returncode != 0 or not wav.exists():
+                return jsonify({'error': 'tts_padding_failed', 'clip_index': i}), 502
+            wav_files.append(wav)
+        playlist = folder / 'audio_concat.txt'
+        playlist.write_text(''.join("file '%s'\n" % p.name for p in wav_files), encoding='utf-8')
+        result = folder / 'narration_timeline.mp3'
+        try:
+            proc = subprocess.run([
+                'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+                '-f', 'concat', '-safe', '0', '-i', str(playlist),
+                '-c:a', 'libmp3lame', '-b:a', '128k', '-ar', '24000', str(result)
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=40, check=False)
+        except subprocess.TimeoutExpired:
+            return jsonify({'error': 'tts_concat_timeout'}), 504
+        if proc.returncode != 0 or not result.is_file():
+            return jsonify({'error': 'tts_concat_failed'}), 502
+        final_info = probe_media_info(result)
+        if abs(final_info['duration_sec'] - float(target)) > 0.15:
+            return jsonify({'error': 'tts_timeline_duration_mismatch',
+                            'actual_sec': final_info['duration_sec']}), 502
+        return send_file(BytesIO(result.read_bytes()), mimetype='audio/mpeg',
+                         as_attachment=True, download_name='narration_timeline.mp3')
 
 if __name__ == "__main__":
 
