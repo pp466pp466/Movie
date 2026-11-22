@@ -2611,7 +2611,7 @@ def tts_timeline():
             for attempt in range(1, 4):
                 try:
                     mp3.unlink(missing_ok=True)
-                    edge_tts.Communicate(txt, voice=voice, rate=rate, pitch=pitch).save_sync(str(mp3))
+                    edge_tts.Communicate(txt, voice=voice, rate=rate, pitch='+0Hz').save_sync(str(mp3))
                     if not mp3.is_file() or mp3.stat().st_size < 1024:
                         raise ValueError('tts_audio_missing_or_too_small')
                     generated = True
@@ -2642,11 +2642,21 @@ def tts_timeline():
                 return jsonify({'error': 'caption_audio_exceeds_slot',
                                 'clip_index': i, 'audio_duration_sec': spoken,
                                 'slot_duration_sec': round(slot, 3)}), 422
-            # 先產生正確長度的有聲+靜音 WAV，避免接段時 MP3 encoder delay 使旁白偏移。
+            # 對非零音高使用本機 FFmpeg 處理，避免 Edge TTS 遠端 pitch 請求失敗。
+            # 換算為近似比例（-18Hz -> 0.90）；維持朗讀長度不變。
+            pitch_delta = int(pitch[:-2])
+            pitch_ratio = 1.0 + pitch_delta / 180.0
+            if pitch_delta:
+                pitch_filter = (
+                    'asetrate=24000*%.6f,aresample=24000,atempo=%.6f,'
+                    'apad,atrim=duration=%.3f'
+                ) % (pitch_ratio, 1.0 / pitch_ratio, slot)
+            else:
+                pitch_filter = 'apad,atrim=duration=%.3f' % slot
             try:
                 proc = subprocess.run([
                     'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
-                    '-i', str(mp3), '-af', 'apad,atrim=duration=%.3f' % slot,
+                    '-i', str(mp3), '-af', pitch_filter,
                     '-ar', '24000', '-ac', '1', '-c:a', 'pcm_s16le', str(wav)
                 ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=30, check=False)
