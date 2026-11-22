@@ -2602,12 +2602,37 @@ def tts_timeline():
         for i, (txt, slot) in enumerate(specs, 1):
             mp3 = folder / ('part_%02d.mp3' % i)
             wav = folder / ('part_%02d.wav' % i)
+            # 遠端 Edge TTS 偶發失敗允許短暫重試；保留失敗階段供 n8n 診斷。
+            generated = False
+            for attempt in range(1, 4):
+                try:
+                    mp3.unlink(missing_ok=True)
+                    edge_tts.Communicate(txt, voice=voice, rate=rate).save_sync(str(mp3))
+                    if not mp3.is_file() or mp3.stat().st_size < 1024:
+                        raise ValueError('tts_audio_missing_or_too_small')
+                    generated = True
+                    break
+                except Exception as exc:
+                    app.logger.warning(
+                        'Timeline TTS synthesis failed: clip=%s attempt=%s/3 type=%s',
+                        i, attempt, type(exc).__name__, exc_info=True,
+                    )
+                    if attempt < 3:
+                        import time
+                        time.sleep(attempt)
+            if not generated:
+                return jsonify({
+                    'error': 'tts_synthesis_failed',
+                    'clip_index': i, 'attempts': 3, 'stage': 'edge_tts'
+                }), 502
             try:
-                edge_tts.Communicate(txt, voice=voice, rate=rate).save_sync(str(mp3))
                 info = probe_media_info(mp3)
             except Exception:
-                app.logger.exception('Timeline TTS generation failure')
-                return jsonify({'error': 'tts_generation_failed', 'clip_index': i}), 502
+                app.logger.exception('Timeline TTS audio probe failed: clip=%s', i)
+                return jsonify({
+                    'error': 'tts_audio_probe_failed',
+                    'clip_index': i, 'stage': 'ffprobe'
+                }), 502
             spoken = info['duration_sec']
             if spoken > slot - 0.10:
                 return jsonify({'error': 'caption_audio_exceeds_slot',
