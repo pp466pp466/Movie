@@ -2578,7 +2578,7 @@ def tts_timeline():
         return jsonify({'error': 'invalid_tts_rate'}), 400
     # 可選的 Edge TTS 音高，預設不改變既有工作流行為。
     pitch = data.get('pitch', '+0Hz')
-    if not isinstance(pitch, str) or not re.fullmatch(r'[+-]\\d{1,2}Hz', pitch) or not -50 <= int(pitch[:-2]) <= 50:
+    if not isinstance(pitch, str) or not re.fullmatch(r'[+-]\d{1,2}Hz', pitch) or not -50 <= int(pitch[:-2]) <= 50:
         return jsonify({'error': 'invalid_tts_pitch'}), 400
     target = data.get('target_duration_sec')
     if type(target) not in (int, float) or not math.isfinite(target) or not 3 <= target <= 80:
