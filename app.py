@@ -2577,10 +2577,10 @@ def tts_story_preview():
     if voice not in ('zh-TW-YunJheNeural', 'zh-TW-HsiaoChenNeural'):
         return jsonify({'error': 'voice_not_supported'}), 400
     rate = data.get('rate', '-5%')
-    if not isinstance(rate, str) or not re.fullmatch(r'[+-]\\d{1,2}%', rate) or not -50 <= int(rate[:-1]) <= 50:
+    if not isinstance(rate, str) or not re.fullmatch(r'[+-]\d{1,2}%', rate) or not -50 <= int(rate[:-1]) <= 50:
         return jsonify({'error': 'invalid_tts_rate'}), 400
     pitch = data.get('pitch', '-18Hz')
-    if not isinstance(pitch, str) or not re.fullmatch(r'[+-]\\d{1,2}Hz', pitch) or not -50 <= int(pitch[:-2]) <= 50:
+    if not isinstance(pitch, str) or not re.fullmatch(r'[+-]\d{1,2}Hz', pitch) or not -50 <= int(pitch[:-2]) <= 50:
         return jsonify({'error': 'invalid_tts_pitch'}), 400
     if data.get('publication_allowed') is True:
         return jsonify({'error': 'story_preview_is_internal_only'}), 400
