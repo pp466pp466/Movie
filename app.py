@@ -888,7 +888,7 @@ def mix_narration_v30():
             # silenceremove stop_periods=-1 會處理段落內的長靜音。
             audio_filter = (
                 "silenceremove=start_periods=0:"
-                "stop_periods=-1:stop_duration=0.85:"
+                "stop_periods=-1:stop_duration=0.10:"
                 "stop_threshold=-38dB:stop_silence={:.3f},"
                 "atempo={:.6f}"
             ).format(pause_cap, speed)
