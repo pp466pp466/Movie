@@ -2541,8 +2541,8 @@ def drive_edit_chapter():
         return jsonify({'error': 'invalid_file_id'}), 400
     if type(chapter_index) is not int or not 1 <= chapter_index <= 12:
         return jsonify({'error': 'invalid_chapter_index'}), 400
-    if not isinstance(clips, list) or not 1 <= len(clips) <= 16:
-        return jsonify({'error': 'clips_must_have_1_to_16_items'}), 400
+    if not isinstance(clips, list) or not 1 <= len(clips) <= 48:
+        return jsonify({'error': 'clips_must_have_1_to_48_items'}), 400
     intervals = []
     total = 0.0
     prev_end = -1.0
@@ -2562,8 +2562,8 @@ def drive_edit_chapter():
         intervals.append((float(a), float(b)))
         total += duration
         prev_end = b
-    if not 3 <= total <= 75:
-        return jsonify({'error': 'chapter_duration_must_be_3_to_75_sec'}), 400
+    if not 3 <= total <= 180:
+        return jsonify({'error': 'chapter_duration_must_be_3_to_180_sec'}), 400
     if payload.get('expected_clip_count') != len(clips):
         return jsonify({'error': 'expected_clip_count_mismatch'}), 400
     expected_total = payload.get('expected_total_sec')
