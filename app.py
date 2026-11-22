@@ -2489,32 +2489,46 @@ def drive_edit_preview():
     header = 'Authorization: Bearer ' + creds.token + '\r\nAccept-Encoding: identity\r\n'
     with TemporaryDirectory(prefix='drive_preview_') as folder_name:
         folder = Path(folder_name)
-        segments = []
-        for idx, (start, end) in enumerate(intervals, 1):
+        # Remote seeks can exceed 34 seconds. Limit concurrency to two small
+        # encodes to keep a four-clip preview within the HTTP request budget.
+        from concurrent.futures import ThreadPoolExecutor
+
+        def render_clip(index_and_interval):
+            idx, (start, end) = index_and_interval
             dest = folder / ('part_%02d.mp4' % idx)
             cmd = [
                 'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
                 '-threads', '1', '-filter_threads', '1',
-                '-rw_timeout', '30000000', '-seekable', '1',
+                '-rw_timeout', '60000000', '-seekable', '1',
                 '-headers', header, '-ss', ('%.3f' % start),
                 '-i', root + '?alt=media',
                 '-t', ('%.3f' % (end-start)),
                 '-map', '0:v:0', '-map', '0:a:0',
-                '-vf', 'scale=960:-2', '-r', '24',
-                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '27',
+                '-vf', 'scale=640:-2', '-r', '24',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '25',
                 '-pix_fmt', 'yuv420p',
                 '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '96k',
                 '-movflags', '+faststart', str(dest)
             ]
+            # Do not log cmd; its headers contain short-lived OAuth credentials.
             try:
                 proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                                      stderr=subprocess.DEVNULL, timeout=34, check=False)
+                                      stderr=subprocess.DEVNULL, timeout=70, check=False)
             except subprocess.TimeoutExpired:
-                return jsonify({'error': 'remote_clip_timeout', 'clip_index': idx}), 504
+                return idx, 'remote_clip_timeout', None
             except OSError:
-                return jsonify({'error': 'ffmpeg_unavailable'}), 502
+                return idx, 'ffmpeg_unavailable', None
             if proc.returncode != 0 or not dest.is_file() or dest.stat().st_size < 1024:
-                return jsonify({'error': 'remote_clip_failed', 'clip_index': idx}), 502
+                return idx, 'remote_clip_failed', None
+            return idx, None, dest
+
+        # At most two FFmpeg jobs: four parallel encoders could exceed RAM.
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            results = list(workers.map(render_clip, enumerate(intervals, 1)))
+        segments = []
+        for idx, error, dest in results:
+            if error:
+                return jsonify({'error': error, 'clip_index': idx}), (504 if error == 'remote_clip_timeout' else 502)
             segments.append(dest)
         playlist = folder / 'concat.txt'
         playlist.write_text(''.join("file '%s'\n" % p.name for p in segments), encoding='utf-8')
