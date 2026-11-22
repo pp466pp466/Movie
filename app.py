@@ -33,6 +33,7 @@ def check_api_key():
         "/audio-info",
         "/concat-audio",
         "/mix-narration",
+        "/mix-narration-v30",
         "/burn-subtitles",
         "/drive-file-info",
         "/drive-range-test",
@@ -841,6 +842,107 @@ def audio_info():
 # video: 已完成剪輯的 MP4
 # audio: TTS 旁白 MP3
 # ==========================================
+
+# ==========================================
+# v30 George 實際影片混音試聽
+# multipart: video (MP4), audio (MP3); speed, pause_cap_sec, original_volume
+# 保留 /mix-narration 不變，不修改 TTS 原始語音。
+# ==========================================
+@app.post("/mix-narration-v30")
+def mix_narration_v30():
+    video = request.files.get("video")
+    audio = request.files.get("audio")
+    if not video or not audio:
+        return jsonify({"error": "video_and_audio_required"}), 400
+
+    try:
+        speed = float(request.form.get("speed", "1.075"))
+        pause_cap = float(request.form.get("pause_cap_sec", "0.65"))
+        original_volume = float(request.form.get("original_volume", "0.30"))
+        narration_volume = float(request.form.get("narration_volume", "1.0"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid_numeric_mix_setting"}), 400
+
+    if not (all(map(math.isfinite, (speed, pause_cap, original_volume, narration_volume)))
+            and 1.0 <= speed <= 1.25 and 0.2 <= pause_cap <= 1.0
+            and 0 <= original_volume <= 1 and 0 <= narration_volume <= 1.5):
+        return jsonify({"error": "mix_setting_out_of_range"}), 400
+
+    try:
+        with TemporaryDirectory(prefix="v30_mix_") as temp:
+            folder = Path(temp)
+            video_path = folder / "source.mp4"
+            narration_path = folder / "source.mp3"
+            prepared_path = folder / "prepared.mp3"
+            out_path = folder / "v30_mix_b.mp4"
+            video.save(video_path)
+            audio.save(narration_path)
+            vinfo = probe_media_info(video_path)
+            ainfo = probe_media_info(narration_path)
+            if not vinfo["has_video"] or not ainfo["has_audio"]:
+                return jsonify({"error": "missing_video_or_audio_track"}), 400
+            if vinfo["duration_sec"] > 180:
+                return jsonify({"error": "v30_preview_video_exceeds_180_seconds"}), 400
+
+            # 靜音上限只作用於較長停頓；不刪除句首/句尾，不改音高。
+            # silenceremove stop_periods=-1 會處理段落內的長靜音。
+            audio_filter = (
+                "silenceremove=start_periods=0:"
+                "stop_periods=-1:stop_duration=0.85:"
+                "stop_threshold=-38dB:stop_silence={:.3f},"
+                "atempo={:.6f}"
+            ).format(pause_cap, speed)
+            subprocess.run(
+                ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                 "-i", str(narration_path), "-vn", "-af", audio_filter,
+                 "-c:a", "libmp3lame", "-b:a", "160k", str(prepared_path)],
+                capture_output=True, text=True, check=True, timeout=90,
+            )
+            prepared = probe_media_info(prepared_path)
+            vd = vinfo["duration_sec"]
+            ad = prepared["duration_sec"]
+            if not math.isfinite(ad) or ad <= 0:
+                return jsonify({"error": "prepared_audio_invalid"}), 502
+            if ad > vd + 0.10:
+                return jsonify({
+                    "error": "narration_exceeds_video_after_processing",
+                    "video_duration_sec": round(vd, 3),
+                    "narration_duration_sec": round(ad, 3),
+                    "hint": "請使用更長的剪輯片段，或縮短說書文案；不可默默截掉旁白",
+                }), 422
+
+            end = "{:.3f}".format(vd)
+            if vinfo["has_audio"]:
+                graph = (
+                    "[0:a:0]volume={:.5f},apad,atrim=duration={},asetpts=PTS-STARTPTS[bg];"
+                    "[1:a:0]volume={:.5f},apad,atrim=duration={},asetpts=PTS-STARTPTS[voice];"
+                    "[bg][voice]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[a]"
+                ).format(original_volume, end, narration_volume, end)
+            else:
+                graph = ("[1:a:0]volume={:.5f},apad,atrim=duration={},"
+                         "asetpts=PTS-STARTPTS[a]").format(narration_volume, end)
+
+            subprocess.run(
+                ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                 "-i", str(video_path), "-i", str(prepared_path),
+                 "-filter_complex", graph, "-map", "0:v:0", "-map", "[a]",
+                 "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                 "-t", end, "-movflags", "+faststart", str(out_path)],
+                capture_output=True, text=True, check=True, timeout=180,
+            )
+            if not out_path.exists() or out_path.stat().st_size < 2048:
+                return jsonify({"error": "mixed_video_missing"}), 502
+            return send_file(
+                BytesIO(out_path.read_bytes()), mimetype="video/mp4",
+                as_attachment=True, download_name="movie_line_v30_mix_B.mp4",
+            )
+    except subprocess.TimeoutExpired:
+        app.logger.exception("v30 mix timeout")
+        return jsonify({"error": "v30_mix_timeout"}), 504
+    except (subprocess.CalledProcessError, OSError, ValueError):
+        app.logger.exception("v30 mix failed")
+        return jsonify({"error": "v30_mix_failed_check_render_logs"}), 502
+
 
 @app.post("/mix-narration")
 def mix_narration():
