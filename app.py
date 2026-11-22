@@ -3004,6 +3004,9 @@ def tts_timeline():
         return send_file(BytesIO(result.read_bytes()), mimetype='audio/mpeg',
                          as_attachment=True, download_name='narration_timeline.mp3')
 
+from movie_line_concat import register_concat_routes
+register_concat_routes(app)
+
 if __name__ == "__main__":
 
     app.run(
