@@ -39,6 +39,7 @@ def check_api_key():
         "/drive-scenes-job",
         "/drive-segment-job",
         "/drive-extract-frames",
+        "/drive-extract-audio",
     ):
         return
 
@@ -2255,6 +2256,83 @@ def drive_extract_frames():
         "frames": images, "checkpoint_modified": False
     })
 
+
+@app.post("/drive-extract-audio")
+def drive_extract_audio():
+    """Read-only bounded MP3 extract from Google Drive MP4 via remote FFmpeg seek."""
+    import re
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "JSON object required"}), 400
+    file_id = payload.get("file_id")
+    if not isinstance(file_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{10,200}", file_id):
+        return jsonify({"error": "invalid_file_id"}), 400
+    try:
+        start_sec = float(payload.get("start_sec", 0))
+        duration_sec = float(payload.get("duration_sec", 60))
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid_audio_parameters"}), 400
+    if not (math.isfinite(start_sec) and math.isfinite(duration_sec)) or not (0 <= start_sec <= 86400 and 15 <= duration_sec <= 120):
+        return jsonify({"error": "audio_interval_out_of_range"}), 400
+    cid = os.environ.get("GOOGLE_CLIENT_ID", "")
+    secret = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+    refresh = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+    if not all((cid, secret, refresh)):
+        return jsonify({"error": "oauth_environment_missing"}), 503
+    try:
+        credentials = Credentials(
+            token=None, refresh_token=refresh,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=cid, client_secret=secret,
+            scopes=["https://www.googleapis.com/auth/drive.readonly"])
+        credentials.refresh(GoogleAuthRequest())
+    except Exception:
+        return jsonify({"error": "oauth_refresh_failed"}), 502
+    media_base = "https://www.googleapis.com/drive/v3/files/" + file_id
+    try:
+        meta = google_requests.get(
+            media_base, params={"fields": "id,mimeType,size", "supportsAllDrives":"true"},
+            headers={"Authorization": "Bearer " + credentials.token}, timeout=(8,15))
+        if meta.status_code != 200:
+            return jsonify({"error": "drive_metadata_failed"}), 502
+        if meta.json().get("mimeType") != "video/mp4":
+            return jsonify({"error": "source_is_not_mp4"}), 400
+    except Exception:
+        return jsonify({"error": "drive_metadata_unavailable"}), 502
+    # Keep the bearer header out of logs and API response.
+    auth = "Authorization: Bearer " + credentials.token + "\r\nAccept-Encoding: identity\r\n"
+    with TemporaryDirectory(prefix="drive_audio_sample_") as temp:
+        target = Path(temp) / "audio_sample.mp3"
+        cmd = [
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "-threads", "1", "-filter_threads", "1", "-rw_timeout", "30000000",
+            "-seekable", "1", "-headers", auth, "-ss", "%.3f" % start_sec,
+            "-i", media_base + "?alt=media", "-map", "0:a:0",
+            "-vn", "-t", "%.3f" % duration_sec,
+            "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", "48k",
+            str(target)
+        ]
+        try:
+            result = subprocess.run(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=145, check=False)
+        except subprocess.TimeoutExpired:
+            return jsonify({"error": "remote_audio_seek_timeout"}), 504
+        except OSError:
+            return jsonify({"error": "ffmpeg_not_available"}), 502
+        if result.returncode != 0 or not target.exists():
+            return jsonify({"error": "remote_audio_extraction_failed_or_no_audio_stream"}), 502
+        raw = target.read_bytes()
+        if not (len(raw) > 2000 and len(raw) <= 1500000 and
+                (raw.startswith(b"ID3") or raw.startswith(b"\xff\xfb") or raw.startswith(b"\xff\xf3") or raw.startswith(b"\xff\xf2"))):
+            return jsonify({"error": "invalid_extracted_mp3"}), 502
+    return jsonify({
+        "status": "remote_audio_extracted", "file_id": file_id,
+        "start_sec": round(start_sec,3), "requested_duration_sec": round(duration_sec,3),
+        "mime_type": "audio/mpeg", "byte_count": len(raw),
+        "audio_base64": base64.b64encode(raw).decode("ascii"),
+        "checkpoint_modified": False
+    })
 
 @app.post("/drive-segment-job")
 def drive_segment_job_start():
