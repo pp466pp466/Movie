@@ -2525,6 +2525,140 @@ def drive_segment_job_status():
     return jsonify(_job_public(state))
 
 
+# v34-03: 遠端完整章節剪輯。保留預覽 API 原有的 3 秒最小片段限制。
+# 請求是同步的；執行成本受 16 段及 75 秒總長限制。
+@app.post('/drive-edit-chapter')
+def drive_edit_chapter():
+    import re
+    from concurrent.futures import ThreadPoolExecutor
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'json_object_required'}), 400
+    fid = payload.get('file_id')
+    chapter_index = payload.get('chapter_index')
+    clips = payload.get('clips')
+    if not isinstance(fid, str) or not re.fullmatch(r'[A-Za-z0-9_-]{10,200}', fid):
+        return jsonify({'error': 'invalid_file_id'}), 400
+    if type(chapter_index) is not int or not 1 <= chapter_index <= 12:
+        return jsonify({'error': 'invalid_chapter_index'}), 400
+    if not isinstance(clips, list) or not 1 <= len(clips) <= 16:
+        return jsonify({'error': 'clips_must_have_1_to_16_items'}), 400
+    intervals = []
+    total = 0.0
+    prev_end = -1.0
+    for index, clip in enumerate(clips, 1):
+        if not isinstance(clip, dict):
+            return jsonify({'error': 'invalid_clip', 'clip_index': index}), 400
+        a, b = clip.get('start_sec'), clip.get('end_sec')
+        if type(a) not in (int, float) or type(b) not in (int, float):
+            return jsonify({'error': 'invalid_clip_number', 'clip_index': index}), 400
+        if not all(map(math.isfinite, (a, b))) or not (0 <= a < b <= 86400):
+            return jsonify({'error': 'invalid_clip_interval', 'clip_index': index}), 400
+        duration = b - a
+        if not 0.25 <= duration <= 20.0:
+            return jsonify({'error': 'clip_duration_must_be_0.25_to_20_sec', 'clip_index': index}), 400
+        if a < prev_end - 0.002:
+            return jsonify({'error': 'clips_must_be_sorted_and_non_overlapping', 'clip_index': index}), 400
+        intervals.append((float(a), float(b)))
+        total += duration
+        prev_end = b
+    if not 3 <= total <= 75:
+        return jsonify({'error': 'chapter_duration_must_be_3_to_75_sec'}), 400
+    if payload.get('expected_clip_count') != len(clips):
+        return jsonify({'error': 'expected_clip_count_mismatch'}), 400
+    expected_total = payload.get('expected_total_sec')
+    if type(expected_total) not in (int, float) or not math.isfinite(expected_total) or abs(total-expected_total)>0.075:
+        return jsonify({'error': 'expected_total_sec_mismatch'}), 400
+
+    cid = os.environ.get('GOOGLE_CLIENT_ID', '')
+    secret = os.environ.get('GOOGLE_CLIENT_SECRET', '')
+    refresh = os.environ.get('GOOGLE_REFRESH_TOKEN', '')
+    if not all((cid, secret, refresh)):
+        return jsonify({'error': 'oauth_environment_missing'}), 503
+    try:
+        creds = Credentials(token=None, refresh_token=refresh,
+            token_uri='https://oauth2.googleapis.com/token',
+            client_id=cid, client_secret=secret,
+            scopes=['https://www.googleapis.com/auth/drive.readonly'])
+        creds.refresh(GoogleAuthRequest())
+    except Exception:
+        app.logger.exception('drive chapter oauth failed')
+        return jsonify({'error': 'oauth_refresh_failed'}), 502
+    root = 'https://www.googleapis.com/drive/v3/files/' + fid
+    try:
+        metadata = google_requests.get(root,
+            params={'fields':'id,mimeType,size', 'supportsAllDrives':'true'},
+            headers={'Authorization':'Bearer '+creds.token}, timeout=(8,15))
+        if metadata.status_code != 200 or metadata.json().get('mimeType') != 'video/mp4':
+            return jsonify({'error': 'source_mp4_metadata_failed'}), 502
+    except Exception:
+        return jsonify({'error': 'drive_metadata_unavailable'}), 502
+
+    # 請勿記錄 ffmpeg cmd；Authorization header 內含短期憑證。
+    auth_header = 'Authorization: Bearer '+creds.token+'\\r\\nAccept-Encoding: identity\\r\\n'
+    with TemporaryDirectory(prefix='drive_chapter_') as temp:
+        folder = Path(temp)
+        def render_one(record):
+            index, (start, end) = record
+            dest = folder / ('part_%03d.mp4' % index)
+            cmd = [
+                'ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y',
+                '-threads','1','-filter_threads','1','-rw_timeout','60000000',
+                '-seekable','1','-headers',auth_header,
+                '-ss','%.3f'%start,'-i',root+'?alt=media',
+                '-t','%.3f'%(end-start),
+                '-map','0:v:0','-map','0:a:0',
+                '-vf','scale=640:-2','-r','24',
+                '-c:v','libx264','-preset','ultrafast','-crf','25',
+                '-pix_fmt','yuv420p',
+                '-c:a','aac','-ar','44100','-ac','2','-b:a','96k',
+                '-movflags','+faststart',str(dest)]
+            try:
+                p = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, timeout=85, check=False)
+            except subprocess.TimeoutExpired:
+                return index, 'remote_clip_timeout', None
+            except OSError:
+                return index, 'ffmpeg_unavailable', None
+            if p.returncode != 0 or not dest.is_file() or dest.stat().st_size < 1024:
+                return index, 'remote_clip_failed', None
+            return index, None, dest
+        # 同時只跑兩個編碼程序以控制 Render 記憶體。
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            rendered = list(pool.map(render_one, enumerate(intervals, 1)))
+        for index, error, _ in rendered:
+            if error:
+                return jsonify({'error':error,'clip_index':index}), 504 if error=='remote_clip_timeout' else 502
+        playlist = folder / 'concat.txt'
+        playlist.write_text(''.join("file '%s'\\n" % r[2].name for r in rendered), encoding='utf-8')
+        out = folder / 'chapter.mp4'
+        try:
+            p = subprocess.run([
+                'ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y',
+                '-f','concat','-safe','0','-i',str(playlist),
+                '-c','copy','-movflags','+faststart',str(out)],
+                stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=35,check=False)
+        except subprocess.TimeoutExpired:
+            return jsonify({'error':'chapter_concat_timeout'}), 504
+        if p.returncode != 0 or not out.is_file():
+            return jsonify({'error':'chapter_concat_failed'}), 502
+        try:
+            info = probe_media_info(out)
+        except Exception:
+            return jsonify({'error':'chapter_probe_failed'}), 502
+        if not info.get('has_video') or abs(float(info['duration_sec'])-total)>max(1.0,len(clips)*0.14):
+            return jsonify({'error':'chapter_duration_mismatch',
+                'actual_duration_sec':info.get('duration_sec'),
+                'expected_duration_sec':round(total,3)}), 502
+        if not 2048 < out.stat().st_size <= 70*1024*1024:
+            return jsonify({'error':'chapter_output_size_invalid'}), 502
+        response = send_file(BytesIO(out.read_bytes()),mimetype='video/mp4',
+            as_attachment=True,download_name='movie_line_v34_chapter_%02d.mp4'%chapter_index)
+        response.headers['X-Movie-Line-Chapter-Index'] = str(chapter_index)
+        response.headers['X-Movie-Line-Clip-Count'] = str(len(clips))
+        return response
+
+
 @app.post('/drive-edit-preview')
 def drive_edit_preview():
     """從 Google Drive 直接遠端 seek，拼接最多 4 段小片，回傳 MP4。
