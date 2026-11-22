@@ -2606,9 +2606,10 @@ def tts_timeline():
         for i, (txt, slot) in enumerate(specs, 1):
             mp3 = folder / ('part_%02d.mp3' % i)
             wav = folder / ('part_%02d.wav' % i)
-            # 遠端 Edge TTS 偶發失敗允許短暫重試；保留失敗階段供 n8n 診斷。
+            # 逐段 TTS 對遠端錯誤做有限重試並回報錯誤種類。
             generated = False
-            for attempt in range(1, 4):
+            last_tts_exception = None
+            for attempt in range(1, 5):
                 try:
                     mp3.unlink(missing_ok=True)
                     edge_tts.Communicate(txt, voice=voice, rate=rate, pitch='+0Hz').save_sync(str(mp3))
@@ -2617,17 +2618,21 @@ def tts_timeline():
                     generated = True
                     break
                 except Exception as exc:
+                    last_tts_exception = exc
                     app.logger.warning(
-                        'Timeline TTS synthesis failed: clip=%s attempt=%s/3 type=%s',
+                        'Timeline TTS synthesis failed: clip=%s attempt=%s/4 type=%s',
                         i, attempt, type(exc).__name__, exc_info=True,
                     )
-                    if attempt < 3:
+                    if attempt < 4:
                         import time
-                        time.sleep(attempt)
+                        time.sleep((2, 4, 8)[attempt - 1])
             if not generated:
+                # 不回傳例外原文（可能含遠端 URL／請求細節），
+                # 只暴露可供定位的異常類型；詳細堆疊仍留在 Render Logs。
                 return jsonify({
                     'error': 'tts_synthesis_failed',
-                    'clip_index': i, 'attempts': 3, 'stage': 'edge_tts'
+                    'clip_index': i, 'attempts': 4, 'stage': 'edge_tts',
+                    'exception_type': type(last_tts_exception).__name__
                 }), 502
             try:
                 info = probe_media_info(mp3)
