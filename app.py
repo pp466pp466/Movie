@@ -42,6 +42,7 @@ def check_api_key():
         "/drive-extract-audio",
         "/drive-edit-preview",
         "/tts-timeline",
+        "/tts-story-preview",
     ):
         return
 
@@ -2549,6 +2550,82 @@ def drive_edit_preview():
             return jsonify({'error': 'preview_size_invalid'}), 502
         return send_file(BytesIO(result), mimetype='video/mp4',
                          as_attachment=True, download_name='movie_line_001_preview.mp4')
+
+
+
+# ==========================================
+# 自然說書試聽：不固定字幕時槽，不補靜音。
+# POST /tts-story-preview: {text, voice, rate, pitch}
+# 僅供內部試聽；不變更既有 /tts-timeline 與字幕輸出。
+# ==========================================
+@app.post('/tts-story-preview')
+def tts_story_preview():
+    import re
+    import time
+    try:
+        import edge_tts
+    except ImportError:
+        return jsonify({'error': 'edge_tts_not_installed'}), 503
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': 'json_object_required'}), 400
+    speech = data.get('text')
+    if not isinstance(speech, str) or not 15 <= len(speech.strip()) <= 450:
+        return jsonify({'error': 'invalid_story_text_length'}), 400
+    voice = data.get('voice', 'zh-TW-YunJheNeural')
+    if voice not in ('zh-TW-YunJheNeural', 'zh-TW-HsiaoChenNeural'):
+        return jsonify({'error': 'voice_not_supported'}), 400
+    rate = data.get('rate', '-5%')
+    if not isinstance(rate, str) or not re.fullmatch(r'[+-]\\d{1,2}%', rate) or not -50 <= int(rate[:-1]) <= 50:
+        return jsonify({'error': 'invalid_tts_rate'}), 400
+    pitch = data.get('pitch', '-18Hz')
+    if not isinstance(pitch, str) or not re.fullmatch(r'[+-]\\d{1,2}Hz', pitch) or not -50 <= int(pitch[:-2]) <= 50:
+        return jsonify({'error': 'invalid_tts_pitch'}), 400
+    if data.get('publication_allowed') is True:
+        return jsonify({'error': 'story_preview_is_internal_only'}), 400
+
+    with TemporaryDirectory(prefix='tts_story_') as name:
+        folder = Path(name)
+        raw = folder / 'story_raw.mp3'
+        out = folder / 'story_preview.mp3'
+        last_exc = None
+        for attempt in range(1, 5):
+            try:
+                raw.unlink(missing_ok=True)
+                edge_tts.Communicate(speech.strip(), voice=voice, rate=rate).save_sync(str(raw))
+                if not raw.is_file() or raw.stat().st_size < 1024:
+                    raise ValueError('tts_audio_missing_or_too_small')
+                break
+            except Exception as exc:
+                last_exc = exc
+                app.logger.warning('Story TTS failed attempt %s/4 type=%s',
+                                   attempt, type(exc).__name__, exc_info=True)
+                if attempt < 4:
+                    time.sleep((2, 4, 8)[attempt - 1])
+        else:
+            return jsonify({'error': 'tts_synthesis_failed', 'attempts': 4,
+                            'exception_type': type(last_exc).__name__}), 502
+
+        pitch_delta = int(pitch[:-2])
+        pitch_ratio = 1.0 + pitch_delta / 180.0
+        # 與 v29b 相同的 FFmpeg 音高近似處理，補償語速以維持自然語句時長。
+        audio_filter = ('asetrate=24000*%.6f,aresample=24000,atempo=%.6f'
+                        % (pitch_ratio, 1.0 / pitch_ratio)) if pitch_delta else 'anull'
+        try:
+            proc = subprocess.run([
+                'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+                '-i', str(raw), '-af', audio_filter,
+                '-ar', '24000', '-ac', '1', '-c:a', 'libmp3lame', '-b:a', '128k',
+                str(out)
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+               check=False, timeout=60)
+            if proc.returncode != 0 or not out.is_file() or out.stat().st_size < 1024:
+                return jsonify({'error': 'story_audio_processing_failed'}), 502
+            return send_file(BytesIO(out.read_bytes()), mimetype='audio/mpeg',
+                             as_attachment=True, download_name='story_preview.mp3')
+        except subprocess.TimeoutExpired:
+            return jsonify({'error': 'story_audio_processing_timeout'}), 504
 
 
 @app.post('/tts-timeline')
